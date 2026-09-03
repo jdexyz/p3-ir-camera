@@ -98,6 +98,38 @@ It drives the same `P3Viewer` as the OpenCV viewer, so the image and the
 recorded files are identical either way. Needs only tkinter (stdlib) and
 Pillow (already required by matplotlib).
 
+#### Reconnecting
+
+The USB link drops for two ordinary reasons: the cable is pulled, or the machine
+sleeps and the handle is invalidated on resume. The GUI recovers from both without
+being restarted -- the **Camera link** panel shows `Connected` / `Reconnecting`, and
+the capture thread retries until the device comes back.
+
+Sleep is the awkward case, because reads may neither fail nor deliver: the image
+just stops updating. A watchdog treats a gap of more than 14 s as a dead link and
+forces a reconnect, so a frozen image becomes a visible `Reconnecting` state rather
+than a stale picture that looks live. **Reconnect** forces the same cycle by hand.
+
+A recording running when the link drops is finalized rather than abandoned, so its
+`.mp4`, `.raw` and `.json` stay valid and hold every frame captured up to the
+disconnect. Recording does not resume by itself -- start it again once the camera
+reconnects.
+
+#### Visible camera
+
+Tick **Record visible alongside thermal** to record a USB (UVC) webcam at the same
+time. The device list is probed at startup and labelled by resolution, since OpenCV
+exposes no device names and its indices change when devices are replugged. The
+highest-resolution device is selected by default, which picks a dedicated capture
+camera over a built-in webcam (the built-in one always takes index 0). `--uvc INDEX`
+preselects a specific one.
+
+The visible stream is written to `BASE_vis.mp4` at the webcam's own frame rate, and
+its frame count, resolution and start time are added to the thermal sidecar under
+`visible`. The two cameras are independent devices with their own clocks, so their
+frames do not correspond one-for-one; align them with `started_at` and
+`measured_fps` rather than by frame index.
+
 ### Viewer
 
 ```bash
@@ -167,7 +199,8 @@ unchanged sensor data either way.
 | --- | --- |
 | `BASE.mp4` | Rendered feed -- colormap, overlays, colorbar |
 | `BASE.raw` | 16-bit little-endian thermal frames, **pre-TNR** sensor counts |
-| `BASE.json` | Frame count, measured fps, array shape, gain/AGC settings, emissivity |
+| `BASE.json` | Frame count, start time, measured fps, array shape, gain/AGC settings, emissivity |
+| `BASE_vis.mp4` | Visible-light camera, when enabled in the GUI |
 
 ```bash
 p3-viewer --range 20 350 --gain low --record run01

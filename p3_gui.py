@@ -16,6 +16,7 @@ overlap.
 from __future__ import annotations
 
 from collections.abc import Callable
+from enum import Enum
 from tkinter import filedialog, messagebox, ttk
 
 import os
@@ -29,9 +30,12 @@ from PIL import Image, ImageTk
 
 import cv2
 import numpy as np
+import usb.util
 
 from p3_camera import GainMode
 from p3_viewer import AGCMode, ColormapID, HotspotMode, P3Viewer
+
+import uvc
 
 
 # Dark palette, chosen so the thermal image stays the brightest thing on screen.
@@ -55,8 +59,31 @@ def default_output_dir() -> str:
     return videos if os.path.isdir(videos) else os.getcwd()
 
 
+class State(str, Enum):
+    """Connection state of the capture thread."""
+
+    CONNECTING = "Connecting"
+    STREAMING = "Streaming"
+    RECONNECTING = "Reconnecting"
+    STOPPED = "Stopped"
+
+
+# A frame read blocks for up to 10 s inside libusb, so the stall watchdog has
+# to allow longer than that before deciding the link is dead.
+STALL_TIMEOUT = 14.0
+RETRY_DELAY = 1.5
+
+
 class CaptureThread(threading.Thread):
-    """Owns the camera and produces rendered frames."""
+    """Owns the camera, produces rendered frames, and survives disconnects.
+
+    The device can vanish underneath us in two ways that matter: the cable is
+    pulled, or the machine sleeps and the handle is invalidated on resume. Both
+    are recoverable, so a failure re-enters the connect loop rather than ending
+    the session. A stall watchdog covers the case where reads neither fail nor
+    deliver -- what a resume from sleep looks like -- since a silently frozen
+    image is worse than a visible error.
+    """
 
     def __init__(self, viewer: P3Viewer) -> None:
         super().__init__(daemon=True)
@@ -64,8 +91,12 @@ class CaptureThread(threading.Thread):
         self.commands: queue.Queue[Callable[[], None]] = queue.Queue()
         self.frame: NDArray[np.uint8] | None = None
         self.error: BaseException | None = None
+        self.state: State = State.CONNECTING
+        self.last_error: str | None = None
+        self.reconnects = 0
         self.ready = threading.Event()
         self._stop = threading.Event()
+        self._reconnect = threading.Event()
         self._lock = threading.Lock()
 
     def post(self, fn: Callable[[], None]) -> None:
@@ -79,43 +110,102 @@ class CaptureThread(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
 
-    def run(self) -> None:
-        try:
-            self.viewer.open_camera()
-            self.ready.set()
-            while not self._stop.is_set():
-                while True:
-                    try:
-                        cmd = self.commands.get_nowait()
-                    except queue.Empty:
-                        break
-                    try:
-                        cmd()
-                    except Exception as e:  # a bad command must not kill capture
-                        print(f"Command failed: {e}")
+    def request_reconnect(self) -> None:
+        """Drop the device and reconnect at the next opportunity."""
+        self._reconnect.set()
 
-                frame = self.viewer.process_frame()
-                if frame is not None:
-                    with self._lock:
-                        self.frame = frame
-        except BaseException as e:
-            self.error = e
-            self.ready.set()
-        finally:
+    def run(self) -> None:
+        while not self._stop.is_set():
             try:
-                self.viewer.close_camera()
-            except Exception:
-                pass
+                self.state = State.CONNECTING
+                self.viewer.open_camera()
+                self.ready.set()
+                self.state = State.STREAMING
+                self._stream()
+            except BaseException as e:  # noqa: BLE001 - must not kill the thread
+                self.last_error = f"{type(e).__name__}: {e}"
+                self.error = e
+            finally:
+                self._teardown()
+
+            if self._stop.is_set():
+                break
+            self.state = State.RECONNECTING
+            self.reconnects += 1
+            self._reconnect.clear()
+            # The device often needs a moment to re-enumerate, especially on
+            # resume from sleep, so retry indefinitely rather than giving up.
+            self._stop.wait(RETRY_DELAY)
+
+        self.state = State.STOPPED
+
+    # -- internals --------------------------------------------------------
+
+    def _stream(self) -> None:
+        last_frame = time.time()
+        while not self._stop.is_set() and not self._reconnect.is_set():
+            self._drain_commands()
+
+            frame = self.viewer.process_frame()
+            now = time.time()
+            if frame is not None:
+                last_frame = now
+                with self._lock:
+                    self.frame = frame
+            elif now - last_frame > STALL_TIMEOUT:
+                raise TimeoutError(
+                    f"no frame for {now - last_frame:.0f}s; link presumed dead"
+                )
+            else:
+                # A read that returns nothing without blocking would otherwise
+                # spin this loop at full speed.
+                time.sleep(0.005)
+
+    def _drain_commands(self) -> None:
+        while True:
+            try:
+                cmd = self.commands.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                cmd()
+            except Exception as e:  # a bad command must not kill capture
+                print(f"Command failed: {e}")
+
+    def _teardown(self) -> None:
+        """Close the device, keeping any in-progress recording valid.
+
+        A recording is finalized rather than abandoned: the frames captured
+        before the disconnect are still good data, and a half-written mp4 with
+        no sidecar is not.
+        """
+        try:
+            self.viewer.close_camera()
+        except Exception:
+            pass
+        # Release the stale handle so the next usb.core.find() gets a fresh
+        # one; without this a post-sleep reconnect keeps failing.
+        try:
+            if self.viewer.camera.dev is not None:
+                usb.util.dispose_resources(self.viewer.camera.dev)
+        except Exception:
+            pass
+        self.viewer.camera.dev = None
+        self.viewer.camera.streaming = False
 
 
 class P3GUI:
     """Tk control panel."""
 
-    def __init__(self, root: tk.Tk, viewer: P3Viewer) -> None:
+    def __init__(self, root: tk.Tk, viewer: P3Viewer,
+                 uvc_index: int | None = None) -> None:
         self.root = root
         self.viewer = viewer
         self.capture = CaptureThread(viewer)
         self._photo: ImageTk.PhotoImage | None = None
+        self.uvc_cam: uvc.UVCCamera | None = None
+        self.uvc_devices: list[tuple[int, int, int]] = []
+        self._uvc_preferred = uvc_index
 
         root.title("P3 Thermal Camera")
         root.geometry("1280x800")
@@ -127,7 +217,7 @@ class P3GUI:
         self._build()
 
         self.capture.start()
-        self.root.after(100, self._wait_for_camera)
+        self.root.after(100, self._tick)
 
     # -- setup ------------------------------------------------------------
 
@@ -162,6 +252,18 @@ class P3GUI:
                      arrowcolor=FG, borderwidth=0)
         st.configure("TCombobox", fieldbackground=BG_INPUT, foreground=FG,
                      arrowcolor=FG, borderwidth=0)
+        # A readonly combobox draws its text using the selection colours, which
+        # default to dark-on-dark against this palette.
+        st.map(
+            "TCombobox",
+            fieldbackground=[("readonly", BG_INPUT)],
+            foreground=[("readonly", FG)],
+            selectbackground=[("readonly", BG_INPUT)],
+            selectforeground=[("readonly", FG)],
+        )
+        self.root.option_add("*TCombobox*Listbox.background", BG_INPUT)
+        self.root.option_add("*TCombobox*Listbox.foreground", FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
 
     def _build(self) -> None:
         # Status bar is packed first so it always reserves its height; packed
@@ -210,10 +312,25 @@ class P3GUI:
                                 fg=FG_DIM, font=("Segoe UI", 11))
         self.preview.place(relx=0.5, rely=0.5, anchor="center")
 
+        self._build_connection(side)
         self._build_record(side)
+        self._build_visible(side)
         self._build_scale(side)
         self._build_camera(side)
         self._build_display(side)
+
+    def _build_connection(self, parent: tk.Widget) -> None:
+        box = ttk.Labelframe(parent, text=" Camera link ", padding=10)
+        box.pack(fill="x", padx=10, pady=(12, 0))
+        self.lbl_conn = ttk.Label(box, text="○ Connecting...", style="Dim.TLabel")
+        self.lbl_conn.pack(anchor="w")
+        self.btn_reconnect = ttk.Button(box, text="Reconnect",
+                                        command=self._reconnect)
+        self.btn_reconnect.pack(fill="x", pady=(8, 0))
+
+    def _reconnect(self) -> None:
+        """Force a reconnect; also the manual recovery if auto-retry is stuck."""
+        self.capture.request_reconnect()
 
     def _build_record(self, parent: tk.Widget) -> None:
         box = ttk.Labelframe(parent, text=" Recording ", padding=10)
@@ -243,6 +360,80 @@ class P3GUI:
 
         ttk.Button(box, text="Snapshot (PNG + raw)",
                    command=self._snapshot).pack(fill="x", pady=(8, 0))
+
+    def _build_visible(self, parent: tk.Widget) -> None:
+        box = ttk.Labelframe(parent, text=" Visible camera ", padding=10)
+        box.pack(fill="x", padx=10, pady=6)
+
+        self.var_uvc_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box, text="Record visible alongside thermal",
+                        variable=self.var_uvc_on,
+                        command=self._toggle_uvc).pack(anchor="w")
+
+        self.var_uvc_dev = tk.StringVar(value="detecting...")
+        self.cb_uvc = ttk.Combobox(box, textvariable=self.var_uvc_dev,
+                                   state="disabled", values=[])
+        self.cb_uvc.pack(fill="x", pady=(8, 0))
+        self.cb_uvc.bind("<<ComboboxSelected>>", lambda _e: self._select_uvc())
+
+        self.lbl_uvc = ttk.Label(box, text="Detecting cameras...",
+                                 style="Dim.TLabel")
+        self.lbl_uvc.pack(anchor="w", pady=(8, 0))
+
+        # Probing opens each device in turn and costs a second or two, so it
+        # must not block the window from appearing.
+        threading.Thread(target=self._probe_uvc, daemon=True).start()
+
+    def _probe_uvc(self) -> None:
+        devices = uvc.list_cameras()
+        self.root.after(0, lambda: self._uvc_probed(devices))
+
+    def _uvc_probed(self, devices: list[tuple[int, int, int]]) -> None:
+        self.uvc_devices = devices
+        if not devices:
+            self.lbl_uvc.config(text="No visible camera found")
+            return
+        self.cb_uvc.config(values=[uvc.describe(*d) for d in devices],
+                           state="readonly")
+        chosen = None
+        if self._uvc_preferred is not None:
+            chosen = next((d for d in devices if d[0] == self._uvc_preferred), None)
+        # Default to the highest-resolution device: a dedicated capture camera
+        # outresolves a built-in webcam, which always takes index 0.
+        chosen = chosen or uvc.best_camera(devices)
+        assert chosen is not None
+        self.var_uvc_dev.set(uvc.describe(*chosen))
+        self.lbl_uvc.config(text=f"{len(devices)} found - not recording")
+
+    def _selected_uvc(self) -> tuple[int, int, int] | None:
+        label = self.var_uvc_dev.get()
+        return next((d for d in self.uvc_devices if uvc.describe(*d) == label), None)
+
+    def _toggle_uvc(self) -> None:
+        if self.var_uvc_on.get():
+            self._select_uvc()
+        else:
+            self._close_uvc()
+            self.lbl_uvc.config(text="Off", foreground=FG_DIM)
+
+    def _select_uvc(self) -> None:
+        """(Re)open the chosen device, so it is warm before recording starts."""
+        if not self.var_uvc_on.get():
+            return
+        device = self._selected_uvc()
+        if device is None:
+            return
+        self._close_uvc()
+        index, w, h = device
+        self.uvc_cam = uvc.UVCCamera(index=index, width=w, height=h)
+        self.uvc_cam.start()
+        self.lbl_uvc.config(text=f"Opening camera {index}...", foreground=FG_DIM)
+
+    def _close_uvc(self) -> None:
+        if self.uvc_cam is not None:
+            self.uvc_cam.stop()
+            self.uvc_cam.join(timeout=3.0)
+            self.uvc_cam = None
 
     def _build_scale(self, parent: tk.Widget) -> None:
         box = ttk.Labelframe(parent, text=" Temperature scale ", padding=10)
@@ -365,6 +556,9 @@ class P3GUI:
 
     def _toggle_record(self) -> None:
         if self._recording:
+            # Finalize the visible stream first so its metadata makes it into
+            # the thermal sidecar, which is written by _stop_recording.
+            self._stop_uvc_recording()
             self.capture.post(self.viewer._stop_recording)
             self.btn_record.config(text="●  Start Recording", bg=REC_RED,
                                    activebackground="#d63c3c")
@@ -387,10 +581,27 @@ class P3GUI:
         ):
             return
 
+        if self.uvc_cam is not None and self.var_uvc_on.get():
+            self.uvc_cam.start_recording(f"{base}_vis.mp4")
+
         # Let the capture thread open the files; it owns the writer.
         self.viewer._pending_record = base
         self.btn_record.config(text="■  Stop Recording", bg="#5c6370",
                                activebackground="#6b7280")
+
+    def _stop_uvc_recording(self) -> None:
+        """Finalize the visible recording and stage it for the sidecar."""
+        if self.uvc_cam is None or not self.uvc_cam.recording:
+            return
+        meta = self.uvc_cam.stop_recording()
+        if meta:
+            base = self.viewer._record_base or ""
+            meta["file"] = f"{os.path.basename(base)}_vis.mp4"
+            meta["note"] = (
+                "Independent device; align with the thermal stream using "
+                "started_at and measured_fps rather than frame index."
+            )
+            self.viewer.extra_metadata = {"visible": meta}
 
     def _snapshot(self) -> None:
         def do() -> None:
@@ -462,27 +673,35 @@ class P3GUI:
 
     # -- loop -------------------------------------------------------------
 
-    def _wait_for_camera(self) -> None:
-        if self.capture.error is not None:
-            messagebox.showerror("Camera error", str(self.capture.error))
-            self.root.destroy()
-            return
-        if not self.capture.ready.is_set():
-            self.root.after(100, self._wait_for_camera)
-            return
-        self._tick()
-
     def _tick(self) -> None:
-        if self.capture.error is not None:
-            messagebox.showerror("Camera error", str(self.capture.error))
-            self.root.destroy()
-            return
-
+        # A camera error is no longer fatal: the capture thread reconnects on
+        # its own, so the window stays up and reports what is happening.
         frame = self.capture.latest()
-        if frame is not None:
+        if frame is not None and self.capture.state is State.STREAMING:
             self._show(frame)
+        self._update_connection()
         self._update_status()
         self.root.after(33, self._tick)
+
+    def _update_connection(self) -> None:
+        state = self.capture.state
+        if state is State.STREAMING:
+            self.lbl_conn.config(text="● Connected", foreground=OK_GREEN)
+            self.btn_reconnect.config(text="Reconnect")
+        elif state is State.CONNECTING:
+            self.lbl_conn.config(text="○ Connecting...", foreground=FG_DIM)
+        else:
+            detail = f" ({self.capture.reconnects})" if self.capture.reconnects else ""
+            self.lbl_conn.config(text=f"● Reconnecting{detail}...",
+                                 foreground=REC_RED)
+            # Say why, so an unplugged cable is distinguishable from a hang.
+            if self.capture.last_error:
+                self.preview.config(
+                    image="",
+                    text=f"Camera disconnected\n\n{self.capture.last_error}\n\n"
+                         "Reconnecting automatically...",
+                )
+                self._photo = None
 
     def _show(self, frame: NDArray[np.uint8]) -> None:
         # Measure the container, never the Label: the Label's own size is a
@@ -536,12 +755,36 @@ class P3GUI:
             self.btn_record.config(text="■  Stop Recording", bg="#5c6370")
         else:
             self.lbl_rec.config(text="Not recording", foreground=FG_DIM)
+            self.btn_record.config(text="●  Start Recording", bg=REC_RED,
+                                   activebackground="#d63c3c")
+            # A disconnect finalizes the thermal recording on the capture
+            # thread; the visible stream has to follow it down.
+            self._stop_uvc_recording()
+
+        self._update_uvc_status()
+
+    def _update_uvc_status(self) -> None:
+        cam = self.uvc_cam
+        if cam is None:
+            return
+        if cam.error:
+            self.lbl_uvc.config(text=cam.error, foreground=REC_RED)
+        elif cam.recording:
+            self.lbl_uvc.config(text=f"● REC  {cam.frames_written} frames",
+                                foreground=REC_RED)
+        elif cam.opened.is_set():
+            frame = cam.latest()
+            size = f"{frame.shape[1]}x{frame.shape[0]}" if frame is not None else "-"
+            self.lbl_uvc.config(text=f"Ready  {size} @ {cam.fps:g} fps",
+                                foreground=OK_GREEN)
 
     def _on_close(self) -> None:
         if self._recording and not messagebox.askyesno(
             "Quit", "A recording is in progress. Stop it and quit?"
         ):
             return
+        self._stop_uvc_recording()
+        self._close_uvc()
         self.capture.stop()
         self.capture.join(timeout=5.0)
         self.root.destroy()
@@ -561,6 +804,9 @@ def main() -> None:
     parser.add_argument("--log-strength", type=float, default=50.0,
                         help="Log curve strength; higher lifts the cool end "
                              "more (default: 50)")
+    parser.add_argument("--uvc", type=int, default=None, metavar="INDEX",
+                        help="Preselect this visible-camera index; the default "
+                             "is the highest-resolution device found")
     parser.add_argument("--gain", choices=["low", "high"], default=None,
                         help="Sensor gain mode at startup")
     parser.add_argument("--record-fps", type=float, default=25.0,
@@ -586,7 +832,7 @@ def main() -> None:
     viewer.zoom = 2
 
     root = tk.Tk()
-    P3GUI(root, viewer)
+    P3GUI(root, viewer, uvc_index=args.uvc)
     root.mainloop()
 
 

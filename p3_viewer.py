@@ -438,6 +438,9 @@ class P3Viewer:
         self._pending_record: str | None = record
         self._last_thermal: NDArray[np.uint16] | None = None
         self._last_stats: dict[str, Any] = {}
+        # Merged into the recording sidecar; lets a caller record a companion
+        # stream (e.g. a visible-light camera) alongside the thermal data.
+        self.extra_metadata: dict[str, Any] = {}
         self._rec_video: cv2.VideoWriter | None = None
         self._rec_raw: Any = None
         self._rec_size: tuple[int, int] | None = None
@@ -1162,6 +1165,9 @@ class P3Viewer:
         env = self.camera.env_params
         meta = {
             "frames": self._rec_count,
+            "started_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.localtime(self._rec_start)
+            ),
             "duration_s": round(elapsed, 3),
             "measured_fps": round(self._rec_count / elapsed, 3) if elapsed > 0 else 0.0,
             "video_fps": self.record_fps,
@@ -1183,6 +1189,8 @@ class P3Viewer:
             "distance_m": env.distance,
             "humidity": env.humidity,
         }
+        if self.extra_metadata:
+            meta.update(self.extra_metadata)
         with open(f"{base}.json", "w") as f:
             json.dump(meta, f, indent=2)
 
