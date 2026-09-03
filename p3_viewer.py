@@ -13,7 +13,8 @@ Controls:
   x - Scale mode     p - Enhanced (CLAHE+DDE)
   a - AGC mode       t - Toggle reticule
   d - Toggle DDE     b - Toggle min/max marker
-  v - Toggle colorbar
+  v - Toggle colorbar  R - Record start/stop
+  a cycles: factory -> percentile -> fixed range -> log range
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from __future__ import annotations
 from enum import IntEnum
 from typing import Any, cast
 
+import json
 import logging
 import time
 
@@ -84,7 +86,8 @@ class AGCMode(IntEnum):
 
     FACTORY = 0  # Use IR brightness from camera (hardware AGC)
     TEMPORAL_1 = 1  # EMA smoothed, 1% percentile
-    FIXED_RANGE = 2  # Fixed temperature range (15-40°C)
+    FIXED_RANGE = 2  # Fixed absolute temperature range, linear
+    LOG_RANGE = 3  # Fixed absolute temperature range, logarithmic
 
 
 AGC_PERCENTILES = {
@@ -264,6 +267,53 @@ def agc_fixed(
     return (np.clip(normalized, 0.0, 1.0) * 255).astype(np.uint8)
 
 
+def agc_log(
+    img: NDArray[np.uint16],
+    temp_min: float = 18.0,
+    temp_max: float = 35.0,
+    strength: float = 50.0,
+) -> NDArray[np.uint8]:
+    """AGC with a fixed temperature range mapped logarithmically.
+
+    A linear scale wide enough for a hot process leaves everything near ambient
+    crushed into the bottom few counts. This compresses the top of the range so
+    the cool end keeps usable contrast while the hot end stays on the same
+    absolute scale.
+
+    The curve is log1p over the normalized position within the range, not over
+    absolute temperature: a true log of Kelvin is very nearly linear across any
+    range this camera can see, so it would do almost nothing.
+
+    Args:
+        img: 16-bit thermal image.
+        temp_min: Bottom of the scale (Celsius).
+        temp_max: Top of the scale (Celsius).
+        strength: Curve strength. Approaches linear near 0; higher values give
+            the cool end more of the output range.
+    """
+    raw_min = (temp_min + 273.15) * 64
+    raw_max = (temp_max + 273.15) * 64
+    x = (img.astype(np.float32) - raw_min) / (raw_max - raw_min)
+    x = np.clip(x, 0.0, 1.0)
+    strength = max(float(strength), 1e-6)
+    normalized = np.log1p(strength * x) / np.log1p(strength)
+    return (np.clip(normalized, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def log_scale_temps(
+    temp_min: float, temp_max: float, strength: float, count: int
+) -> list[float]:
+    """Temperatures at evenly spaced positions up a log-scaled colorbar.
+
+    Inverse of agc_log's mapping, so colorbar ticks label the temperature the
+    color at that height actually represents.
+    """
+    strength = max(float(strength), 1e-6)
+    positions = np.linspace(0.0, 1.0, count)
+    x = np.expm1(positions * np.log1p(strength)) / strength
+    return [float(temp_min + xi * (temp_max - temp_min)) for xi in x]
+
+
 def dde(
     img_u8: NDArray[np.uint8],
     strength: float = 0.5,
@@ -332,7 +382,11 @@ class P3Viewer:
 
     def __init__(self, model: Model | str = Model.P3, serial_port: str = "/dev/ttyACM0",
                  baud_rate: int = 115200, lockin_period: float = 1.0,
-                 lockin_integration: float = 60.0, lockin_invert: bool = False) -> None:
+                 lockin_integration: float = 60.0, lockin_invert: bool = False,
+                 fixed_range: tuple[float, float] | None = None,
+                 log_scale: bool = False, log_strength: float = 50.0,
+                 gain_mode: GainMode | None = None,
+                 record: str | None = None, record_fps: float = 25.0) -> None:
         """Initialize viewer.
 
         Args:
@@ -341,6 +395,14 @@ class P3Viewer:
             baud_rate: Baud rate for serial port.
             lockin_period: Lock-in period in seconds.
             lockin_integration: Integration time in seconds.
+            fixed_range: (min_c, max_c) bounds for the absolute AGC modes.
+                Selects FIXED_RANGE (or LOG_RANGE) at startup when given.
+            log_scale: Use the logarithmic mapping for fixed_range.
+            log_strength: Log curve strength; higher lifts the cool end more.
+            gain_mode: Sensor gain mode to apply at startup. LOW is required
+                for scenes above 150 C.
+            record: Base path for recording. Starts recording immediately.
+            record_fps: Frame rate written into the mp4 container.
         """
         config = get_model_config(model)
         self.camera = P3Camera(config=config)
@@ -364,6 +426,24 @@ class P3Viewer:
         self.scale_mode: ScaleMode = ScaleMode.BICUBIC
         self.cv_linetype: CVLineType = CVLineType.LINE_AA
         self.agc_mode: AGCMode = AGCMode.FACTORY
+        self.fixed_range: tuple[float, float] = (18.0, 35.0)
+        if fixed_range is not None:
+            self.fixed_range = fixed_range
+            self.agc_mode = AGCMode.LOG_RANGE if log_scale else AGCMode.FIXED_RANGE
+        self.log_strength: float = log_strength
+        self.startup_gain_mode: GainMode | None = gain_mode
+        # Recording state
+        self.record_fps: float = record_fps
+        self._record_base: str | None = record
+        self._pending_record: str | None = record
+        self._last_thermal: NDArray[np.uint16] | None = None
+        self._last_stats: dict[str, Any] = {}
+        self._rec_video: cv2.VideoWriter | None = None
+        self._rec_raw: Any = None
+        self._rec_size: tuple[int, int] | None = None
+        self._rec_shape: tuple[int, int] | None = None
+        self._rec_count: int = 0
+        self._rec_start: float = 0.0
         self.dde_strength: float = 0.3
         self.tnr_alpha: float = 0.5
         self._fps_count: int = 0
@@ -377,14 +457,79 @@ class P3Viewer:
         self.lockin_thread: threading.Thread | None = None
         self.lockin_running: bool = False
 
+    def open_camera(self) -> tuple[str, str]:
+        """Connect, start streaming, and apply startup settings.
+
+        Returns:
+            (device name, firmware version).
+        """
+        self.camera.connect()
+        name, version = self.camera.init()
+        self.camera.start_streaming()
+
+        # Gain must be set while streaming; the camera NAKs the control
+        # transfer if the mode changes between init and start_streaming.
+        if self.startup_gain_mode is not None:
+            self.camera.set_gain_mode(self.startup_gain_mode)
+        return name, version
+
+    def close_camera(self) -> None:
+        """Finalize any recording and stop the stream."""
+        self._stop_recording()
+        self.camera.stop_streaming()
+
+    def process_frame(self) -> NDArray[np.uint8] | None:
+        """Read, render and record one frame.
+
+        Shared by the OpenCV viewer and the Tk GUI so both use identical
+        processing. Returns the rendered display image, or None if no frame
+        was available.
+        """
+        ir_brightness, thermal = self.camera.read_frame_both()
+        if thermal is None:
+            return None
+        self._ir_brightness = ir_brightness
+
+        # Feed frames to lock-in controller so only one thread reads USB.
+        if self.lockin_controller is not None and self.lockin_running:
+            try:
+                self.lockin_controller.push_frame(thermal.copy(), time.perf_counter())
+            except Exception:
+                pass
+
+        raw_thermal = thermal
+
+        # Apply temporal noise reduction
+        thermal = tnr(thermal, self._prev_frame, alpha=self.tnr_alpha)
+        self._prev_frame = thermal.copy()
+        self._last_thermal = thermal
+
+        self._last_display = self._render(thermal)
+
+        # Recording needs a rendered frame to size the writer, so the
+        # requested start is deferred until here.
+        if self._pending_record is not None:
+            self._start_recording(self._pending_record)
+            self._pending_record = None
+        self._record_frame(raw_thermal, self._last_display)
+        self._update_fps()
+        return self._last_display
+
     def run(self) -> None:
         """Main viewer loop."""
         model_name = self.model.value.upper()
         print(f"{model_name} Thermal Viewer")
-        self.camera.connect()
-        name, version = self.camera.init()
+        name, version = self.open_camera()
         print(f"Device: {name}, Firmware: {version}")
-        self.camera.start_streaming()
+        if self.startup_gain_mode is not None:
+            print(f"Gain mode: {self.startup_gain_mode.name}")
+        if self.agc_mode in (AGCMode.FIXED_RANGE, AGCMode.LOG_RANGE):
+            extra = (f", log strength {self.log_strength:g}"
+                     if self.agc_mode == AGCMode.LOG_RANGE else "")
+            print(
+                f"AGC: {self.agc_mode.name} {self.fixed_range[0]:g} to "
+                f"{self.fixed_range[1]:g} C{extra}"
+            )
         print("Press 'h' for help")
 
         window_name = f"{model_name} Thermal"
@@ -393,34 +538,18 @@ class P3Viewer:
 
         try:
             while True:
-
-                ir_brightness, thermal = self.camera.read_frame_both()
-                if thermal is None:
+                display = self.process_frame()
+                if display is None:
                     continue
-                self._ir_brightness = ir_brightness
 
-                # Feed frames to lock-in controller so only main thread reads USB.
-                if self.lockin_controller is not None and self.lockin_running:
-                    try:
-                        self.lockin_controller.push_frame(thermal.copy(), time.perf_counter())
-                    except Exception:
-                        pass
+                cv2.imshow(window_name, display)
 
-                # Apply temporal noise reduction
-                thermal = tnr(thermal, self._prev_frame, alpha=self.tnr_alpha)
-                self._prev_frame = thermal.copy()
-
-                self._last_display = self._render(thermal)
-                window_name = f"{self.model.value.upper()} Thermal"
-                cv2.imshow(window_name, self._last_display)
-                self._update_fps()
-
-                if not self._handle_key(thermal):
+                if not self._handle_key(self._last_thermal):
                     break
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                     break
         finally:
-            self.camera.stop_streaming()
+            self.close_camera()
             cv2.destroyAllWindows()
 
     def _update_fps(self) -> None:
@@ -521,7 +650,9 @@ class P3Viewer:
             else:
                 img = agc_temporal(thermal, pct=1.0)
         elif self.agc_mode == AGCMode.FIXED_RANGE:
-            img = agc_fixed(thermal)
+            img = agc_fixed(thermal, *self.fixed_range)
+        elif self.agc_mode == AGCMode.LOG_RANGE:
+            img = agc_log(thermal, *self.fixed_range, strength=self.log_strength)
         else:
             pct = AGC_PERCENTILES.get(self.agc_mode, 1.0)
             img = agc_temporal(thermal, pct=pct)
@@ -555,6 +686,25 @@ class P3Viewer:
         # value range
         frame_stats['range_min'] = int(np.min(img))
         frame_stats['range_max'] = int(np.max(img))
+
+        # Colorbar extent. Normally it spans just the values present in the
+        # frame, but under FIXED_RANGE that would re-label the scale every
+        # frame and hide the fact that the mapping is absolute.
+        if self.agc_mode in (AGCMode.FIXED_RANGE, AGCMode.LOG_RANGE):
+            frame_stats['cbar_min'] = 0
+            frame_stats['cbar_max'] = 255
+            frame_stats['cbar_tmin'] = self.fixed_range[0]
+            frame_stats['cbar_tmax'] = self.fixed_range[1]
+        else:
+            frame_stats['cbar_min'] = frame_stats['range_min']
+            frame_stats['cbar_max'] = frame_stats['range_max']
+            frame_stats['cbar_tmin'] = frame_stats['tmin']
+            frame_stats['cbar_tmax'] = frame_stats['tmax']
+        frame_stats['cbar_log'] = self.agc_mode == AGCMode.LOG_RANGE
+        frame_stats['cbar_strength'] = self.log_strength
+
+        # Expose stats so an external UI can show readouts without re-deriving them.
+        self._last_stats = frame_stats
 
         # Apply colormap
         img = apply_colormap(img, self.colormap_idx)
@@ -615,9 +765,9 @@ class P3Viewer:
         # resample color map to image resolution
         h, w = img.shape[:2]
         h_cbar = int(height * h)
-        val_range = (frame_stats['range_max']-frame_stats['range_min'])
+        val_range = (frame_stats['cbar_max']-frame_stats['cbar_min'])
         ind = (np.arange(0.5, h_cbar) / h_cbar) * val_range
-        ind = (ind + frame_stats['range_min']+ .5).astype(np.uint8)
+        ind = (ind + frame_stats['cbar_min']+ .5).astype(np.uint8)
         cmap_resamp = get_colormap(self.colormap_idx)[ind[::-1]]
 
         # draw colorbar
@@ -636,7 +786,18 @@ class P3Viewer:
 
         # draw ticks
         tick_pos = (np.linspace(0,1, ticks) * h_cbar + y_offset).astype(np.uint16)[::-1]
-        tick_labels = [f'{t:.1f}' for t in np.linspace(frame_stats['tmin'], frame_stats['tmax'], ticks)]
+        if frame_stats.get('cbar_log'):
+            # Ticks sit at even heights, so their labels must follow the same
+            # curve the image was mapped with.
+            tick_temps = log_scale_temps(
+                frame_stats['cbar_tmin'], frame_stats['cbar_tmax'],
+                frame_stats['cbar_strength'], ticks,
+            )
+        else:
+            tick_temps = list(
+                np.linspace(frame_stats['cbar_tmin'], frame_stats['cbar_tmax'], ticks)
+            )
+        tick_labels = [f'{t:.1f}' for t in tick_temps]
         for pos, label in zip(tick_pos, tick_labels):
             cv2.line(img, (w-x_offset-width, pos), (w-x_offset, pos), COLOR_TEXT, 1, self.cv_linetype)
             cv2.putText(
@@ -882,6 +1043,11 @@ class P3Viewer:
                     self.lockin_running = False
                     self.lockin_controller = None
                     self.lockin_thread = None
+        elif key == ord("R"):
+            if self._rec_raw is None:
+                self._start_recording()
+            else:
+                self._stop_recording()
         elif key == ord("a"):
             self.agc_mode = AGCMode((self.agc_mode + 1) % len(AGCMode))
             print(f"AGC: {self.agc_mode.name}")
@@ -928,6 +1094,105 @@ class P3Viewer:
         print(f"Center temp (e={env.emissivity:.2f}): {corrected_temp:.1f}C")
         np.save(f"p3_raw_{ts}.npy", thermal)
         print(f"Saved: p3_raw_{ts}.npy\n")
+
+    def _start_recording(self, base: str | None = None) -> None:
+        """Open the raw thermal stream and the mp4 writer."""
+        if self._rec_raw is not None:
+            return
+        if base is None:
+            base = f"p3_rec_{time.strftime('%Y%m%d_%H%M%S')}"
+        if base.lower().endswith(".mp4"):
+            base = base[:-4]
+        if self._last_display is None:
+            print("No frame yet; cannot start recording")
+            return
+
+        h, w = self._last_display.shape[:2]
+        self._rec_size = (w, h)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(f"{base}.mp4", fourcc, self.record_fps, (w, h))
+        if not writer.isOpened():
+            print(f"Failed to open video writer for {base}.mp4")
+            return
+
+        self._rec_video = writer
+        self._rec_raw = open(f"{base}.raw", "wb")
+        self._record_base = base
+        self._rec_count = 0
+        self._rec_shape = None
+        self._rec_start = time.time()
+        print(f"Recording: {base}.mp4 + {base}.raw ({w}x{h} @ {self.record_fps:g} fps)")
+
+    def _record_frame(
+        self, raw_thermal: NDArray[np.uint16], display: NDArray[np.uint8]
+    ) -> None:
+        """Append one frame to both recordings."""
+        if self._rec_raw is None:
+            return
+
+        # Raw is pre-TNR sensor data, native byte order forced to little-endian.
+        self._rec_raw.write(np.ascontiguousarray(raw_thermal, dtype="<u2").tobytes())
+        if self._rec_shape is None:
+            self._rec_shape = (int(raw_thermal.shape[0]), int(raw_thermal.shape[1]))
+
+        # The mp4 needs a constant frame size; zoom/rotate mid-recording would
+        # otherwise silently produce a corrupt file.
+        assert self._rec_size is not None
+        w, h = self._rec_size
+        if (display.shape[1], display.shape[0]) != (w, h):
+            display = cv2.resize(display, (w, h), interpolation=cv2.INTER_NEAREST)
+        if self._rec_video is not None:
+            self._rec_video.write(display)
+        self._rec_count += 1
+
+    def _stop_recording(self) -> None:
+        """Close both recordings and write the sidecar metadata."""
+        if self._rec_raw is None:
+            return
+
+        base = self._record_base or "p3_rec"
+        elapsed = time.time() - self._rec_start
+        self._rec_raw.close()
+        self._rec_raw = None
+        if self._rec_video is not None:
+            self._rec_video.release()
+            self._rec_video = None
+
+        rows, cols = self._rec_shape or (0, 0)
+        env = self.camera.env_params
+        meta = {
+            "frames": self._rec_count,
+            "duration_s": round(elapsed, 3),
+            "measured_fps": round(self._rec_count / elapsed, 3) if elapsed > 0 else 0.0,
+            "video_fps": self.record_fps,
+            "raw_file": f"{base}.raw",
+            "raw_dtype": "<u2",
+            "raw_shape": [self._rec_count, rows, cols],
+            "raw_note": "Pre-TNR sensor counts; raw/64 - 273.15 = degrees C.",
+            "video_file": f"{base}.mp4",
+            "model": self.model.value,
+            "gain_mode": self.camera.gain_mode.name,
+            "agc_mode": self.agc_mode.name,
+            "fixed_range_c": list(self.fixed_range),
+            "log_strength": (
+                self.log_strength if self.agc_mode == AGCMode.LOG_RANGE else None
+            ),
+            "emissivity": env.emissivity,
+            "ambient_temp_c": env.ambient_temp,
+            "reflected_temp_c": env.reflected_temp,
+            "distance_m": env.distance,
+            "humidity": env.humidity,
+        }
+        with open(f"{base}.json", "w") as f:
+            json.dump(meta, f, indent=2)
+
+        print(
+            f"Stopped: {self._rec_count} frames, {elapsed:.1f}s "
+            f"({meta['measured_fps']:g} fps) -> {base}.mp4 / {base}.raw / {base}.json"
+        )
+        self._rec_count = 0
+        self._rec_size = None
+        self._rec_shape = None
 
     def _screenshot(self) -> None:
         """Save screenshot."""
@@ -1013,14 +1278,69 @@ def main() -> None:
         default=False,
         help="Invert lock-in serial output logic (accepts 0/1 or false/true).",
     )
+    parser.add_argument(
+        "--range",
+        nargs=2,
+        type=float,
+        metavar=("MIN_C", "MAX_C"),
+        default=None,
+        help="Fixed absolute temperature scale in Celsius, e.g. --range 20 350. "
+             "Selects FIXED_RANGE AGC at startup (no time-varying autoscale).",
+    )
+    parser.add_argument(
+        "--log",
+        action="store_true",
+        help="Map --range logarithmically so near-ambient detail stays visible "
+             "alongside a hot target. Still an absolute, time-invariant scale.",
+    )
+    parser.add_argument(
+        "--log-strength",
+        type=float,
+        default=50.0,
+        help="Log curve strength; higher lifts the cool end more (default: 50)",
+    )
+    parser.add_argument(
+        "--gain",
+        type=str,
+        choices=["low", "high", "auto"],
+        default=None,
+        help="Sensor gain mode at startup. LOW is required above 150 C.",
+    )
+    parser.add_argument(
+        "--record",
+        type=str,
+        default=None,
+        help="Start recording immediately to BASE.mp4 (rendered) and BASE.raw "
+             "(16-bit pre-TNR thermal) plus BASE.json metadata.",
+    )
+    parser.add_argument(
+        "--record-fps",
+        type=float,
+        default=25.0,
+        help="Frame rate written into the mp4 container (default: 25.0)",
+    )
     args = parser.parse_args()
+
+    if args.range is not None and args.range[0] >= args.range[1]:
+        parser.error("--range MIN_C must be less than MAX_C")
+    if args.log and args.range is None:
+        parser.error("--log requires --range")
+    if args.log_strength <= 0:
+        parser.error("--log-strength must be positive")
 
     logging.basicConfig(level=logging.DEBUG)
 
     try:
+           gain_mode = (
+               GainMode[args.gain.upper()] if args.gain is not None else None
+           )
+           fixed_range = tuple(args.range) if args.range is not None else None
            P3Viewer(model=args.model, serial_port=args.serial_port, baud_rate=args.baud_rate,
                lockin_period=args.period, lockin_integration=args.integration,
-               lockin_invert=args.invert).run()
+               lockin_invert=args.invert, fixed_range=fixed_range,
+               log_scale=args.log, log_strength=args.log_strength,
+               gain_mode=gain_mode, record=args.record,
+               record_fps=args.record_fps).run()
     except RuntimeError as e:
         print(f"Error: {e}")
     except KeyboardInterrupt:

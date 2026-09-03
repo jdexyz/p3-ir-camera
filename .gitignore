@@ -26,3 +26,8 @@ venv/
 .ruff_cache/
 *.png
 *.npy
+
+# Recordings (.png/.npy screenshots and dumps are already covered above)
+p3_rec_*
+*.raw
+*.mp4
