@@ -17,6 +17,8 @@ from numpy.typing import NDArray
 import cv2
 import numpy as np
 
+from overlay import draw_timestamp
+
 
 # Opening a camera costs ~1-2 s per index, so probing is deliberately shallow.
 MAX_PROBE_INDEX = 4
@@ -87,9 +89,11 @@ class UVCCamera(threading.Thread):
         fps: float | None = None,
         width: int | None = None,
         height: int | None = None,
+        show_timestamp: bool = True,
     ) -> None:
         super().__init__(daemon=True)
         self.index = index
+        self.show_timestamp = show_timestamp
         # None means take the rate from the device. Writing a webcam's frames
         # into a container labelled with the thermal camera's rate plays the
         # result back at the wrong speed.
@@ -154,6 +158,7 @@ class UVCCamera(threading.Thread):
             "resolution": list(size) if size else None,
             "device_index": self.index,
             "video_fps": self.fps,
+            "timestamped": self.show_timestamp,
         }
         self._last_meta = meta
         return meta
@@ -188,11 +193,17 @@ class UVCCamera(threading.Thread):
                     # frame stops updating.
                     time.sleep(0.02)
                     continue
+                captured = time.time()
                 with self._lock:
                     self._frame = frame
                     self._open_pending_writer(frame)
                     if self._writer is not None:
-                        self._writer.write(self._fit(frame))
+                        # Copy first: the stamp must not land in the frame
+                        # handed out by latest(), which callers may reuse.
+                        out = self._fit(frame).copy()
+                        if self.show_timestamp:
+                            draw_timestamp(out, captured)
+                        self._writer.write(out)
                         self._count += 1
         except Exception as e:
             self.error = str(e)

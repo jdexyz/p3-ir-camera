@@ -204,6 +204,10 @@ class P3GUI:
         self.capture = CaptureThread(viewer)
         self._photo: ImageTk.PhotoImage | None = None
         self.uvc_cam: uvc.UVCCamera | None = None
+        # True between pressing record and pressing stop. The thermal writer
+        # opens a frame later than the click, so "not recording yet" must not
+        # be mistaken for "recording finished".
+        self._record_intent = False
         self.uvc_devices: list[tuple[int, int, int]] = []
         self._uvc_preferred = uvc_index
 
@@ -425,7 +429,8 @@ class P3GUI:
             return
         self._close_uvc()
         index, w, h = device
-        self.uvc_cam = uvc.UVCCamera(index=index, width=w, height=h)
+        self.uvc_cam = uvc.UVCCamera(index=index, width=w, height=h,
+                                     show_timestamp=self.var_stamp.get())
         self.uvc_cam.start()
         self.lbl_uvc.config(text=f"Opening camera {index}...", foreground=FG_DIM)
 
@@ -524,12 +529,14 @@ class P3GUI:
         self.var_ret = tk.BooleanVar(value=self.viewer.show_reticule)
         self.var_cbar = tk.BooleanVar(value=self.viewer.show_colorbar)
         self.var_mirror = tk.BooleanVar(value=self.viewer.mirror)
+        self.var_stamp = tk.BooleanVar(value=self.viewer.show_timestamp)
         self.var_hot = tk.BooleanVar(value=self.viewer.hotspot_mode != HotspotMode.OFF)
         for text, var in (
             ("Enhanced (CLAHE + DDE)", self.var_enh),
             ("Reticule", self.var_ret),
             ("Colorbar", self.var_cbar),
             ("Min/max markers", self.var_hot),
+            ("Date/time stamp", self.var_stamp),
             ("Mirror", self.var_mirror),
         ):
             ttk.Checkbutton(box, text=text, variable=var,
@@ -558,6 +565,7 @@ class P3GUI:
         if self._recording:
             # Finalize the visible stream first so its metadata makes it into
             # the thermal sidecar, which is written by _stop_recording.
+            self._record_intent = False
             self._stop_uvc_recording()
             self.capture.post(self.viewer._stop_recording)
             self.btn_record.config(text="●  Start Recording", bg=REC_RED,
@@ -581,6 +589,7 @@ class P3GUI:
         ):
             return
 
+        self._record_intent = True
         if self.uvc_cam is not None and self.var_uvc_on.get():
             self.uvc_cam.start_recording(f"{base}_vis.mp4")
 
@@ -667,6 +676,9 @@ class P3GUI:
         v.show_colorbar = self.var_cbar.get()
         v.mirror = self.var_mirror.get()
         v.hotspot_mode = HotspotMode.MINMAX if self.var_hot.get() else HotspotMode.OFF
+        v.show_timestamp = self.var_stamp.get()
+        if self.uvc_cam is not None:
+            self.uvc_cam.show_timestamp = self.var_stamp.get()
 
     def _rotate(self) -> None:
         self.viewer.rotation = (self.viewer.rotation + 90) % 360
@@ -758,8 +770,12 @@ class P3GUI:
             self.btn_record.config(text="●  Start Recording", bg=REC_RED,
                                    activebackground="#d63c3c")
             # A disconnect finalizes the thermal recording on the capture
-            # thread; the visible stream has to follow it down.
-            self._stop_uvc_recording()
+            # thread; the visible stream has to follow it down. Waiting for
+            # the pending start to clear avoids tearing down a recording that
+            # simply has not opened yet.
+            if self._record_intent and self.viewer._pending_record is None:
+                self._record_intent = False
+                self._stop_uvc_recording()
 
         self._update_uvc_status()
 
@@ -804,6 +820,8 @@ def main() -> None:
     parser.add_argument("--log-strength", type=float, default=50.0,
                         help="Log curve strength; higher lifts the cool end "
                              "more (default: 50)")
+    parser.add_argument("--no-timestamp", action="store_true",
+                        help="Do not burn a date/time stamp into the video")
     parser.add_argument("--uvc", type=int, default=None, metavar="INDEX",
                         help="Preselect this visible-camera index; the default "
                              "is the highest-resolution device found")
@@ -825,6 +843,7 @@ def main() -> None:
         fixed_range=tuple(args.range) if args.range else None,
         log_scale=args.log,
         log_strength=args.log_strength,
+        show_timestamp=not args.no_timestamp,
         gain_mode=GainMode[args.gain.upper()] if args.gain else None,
         record_fps=args.record_fps,
     )

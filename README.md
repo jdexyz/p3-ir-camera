@@ -218,6 +218,17 @@ raw = np.memmap("run01.raw", dtype="<u2", mode="r").reshape(n, rows, cols)
 celsius = raw / 64.0 - 273.15
 ```
 
+#### Timestamp
+
+Both videos carry a burned-in `YYYY-MM-DD HH:MM:SS` stamp in the top-right corner,
+drawn from each frame's own capture time. The thermal and visible streams therefore
+show the same wall-clock time on frames captured together, which is what makes them
+correlatable despite running at different rates.
+
+Turn it off with `--no-timestamp`, the **Date/time stamp** checkbox, or `T` in the
+OpenCV viewer. It is burned into the rendered mp4 and the preview only -- the `.raw`
+thermal stream is never touched, so measurements are unaffected.
+
 `--record-fps` (default 25) only sets the mp4 container rate. Actual capture rate is
 recorded as `measured_fps` in the sidecar; use it if playback speed matters.
 
@@ -234,6 +245,7 @@ recorded as `measured_fps` in the sidecar; use it if playback speed matters.
 - `s` - Trigger shutter/NUC
 - `g` - Toggle gain mode (high/low)
 - `R` - Start/stop recording (mp4 + raw)
+- `T` - Toggle the date/time stamp
 - `r` - Rotate display 90°
 - `m` - Mirror display
 - `+`/`-` - Zoom in/out

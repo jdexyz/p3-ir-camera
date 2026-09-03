@@ -14,6 +14,7 @@ Controls:
   a - AGC mode       t - Toggle reticule
   d - Toggle DDE     b - Toggle min/max marker
   v - Toggle colorbar  R - Record start/stop
+  T - Toggle timestamp
   a cycles: factory -> percentile -> fixed range -> log range
 """
 
@@ -36,6 +37,7 @@ import matplotlib.cm as cm
 import matplotlib.colors as mcolors
 
 from lockin import LockInController
+from overlay import draw_timestamp
 
 from p3_camera import (
     GainMode,
@@ -385,6 +387,7 @@ class P3Viewer:
                  lockin_integration: float = 60.0, lockin_invert: bool = False,
                  fixed_range: tuple[float, float] | None = None,
                  log_scale: bool = False, log_strength: float = 50.0,
+                 show_timestamp: bool = True,
                  gain_mode: GainMode | None = None,
                  record: str | None = None, record_fps: float = 25.0) -> None:
         """Initialize viewer.
@@ -397,6 +400,7 @@ class P3Viewer:
             lockin_integration: Integration time in seconds.
             fixed_range: (min_c, max_c) bounds for the absolute AGC modes.
                 Selects FIXED_RANGE (or LOG_RANGE) at startup when given.
+            show_timestamp: Burn a date/time stamp into the rendered image.
             log_scale: Use the logarithmic mapping for fixed_range.
             log_strength: Log curve strength; higher lifts the cool end more.
             gain_mode: Sensor gain mode to apply at startup. LOW is required
@@ -417,6 +421,7 @@ class P3Viewer:
         self.mirror: bool = False
         self.show_help: bool = False
         self.show_reticule: bool = True
+        self.show_timestamp: bool = show_timestamp
         self.show_colorbar: bool = True
         self.hotspot_mode: int = HotspotMode.OFF
         self.zoom: int = 3
@@ -437,6 +442,7 @@ class P3Viewer:
         self._record_base: str | None = record
         self._pending_record: str | None = record
         self._last_thermal: NDArray[np.uint16] | None = None
+        self._frame_time: float | None = None
         self._last_stats: dict[str, Any] = {}
         # Merged into the recording sidecar; lets a caller record a companion
         # stream (e.g. a visible-light camera) alongside the thermal data.
@@ -491,6 +497,7 @@ class P3Viewer:
         ir_brightness, thermal = self.camera.read_frame_both()
         if thermal is None:
             return None
+        self._frame_time = time.time()
         self._ir_brightness = ir_brightness
 
         # Feed frames to lock-in controller so only one thread reads USB.
@@ -748,6 +755,11 @@ class P3Viewer:
                 except Exception:
                     # Don't let lock-in display errors break rendering
                     pass
+
+        # Last, so nothing can paint over it. Uses the frame's capture time
+        # rather than render time, which matters once frames are queued.
+        if self.show_timestamp:
+            draw_timestamp(result, self._frame_time)
 
         return result
     
@@ -1056,6 +1068,9 @@ class P3Viewer:
             print(f"AGC: {self.agc_mode.name}")
         elif key == ord("t"):
             self.show_reticule = not self.show_reticule
+        elif key == ord("T"):
+            self.show_timestamp = not self.show_timestamp
+            print("Timestamp:", "ON" if self.show_timestamp else "OFF")
         elif key == ord("v"):
             self.show_colorbar = not self.show_colorbar
         elif key == ord("b"):
@@ -1308,6 +1323,11 @@ def main() -> None:
         help="Log curve strength; higher lifts the cool end more (default: 50)",
     )
     parser.add_argument(
+        "--no-timestamp",
+        action="store_true",
+        help="Do not burn a date/time stamp into the rendered image and mp4",
+    )
+    parser.add_argument(
         "--gain",
         type=str,
         choices=["low", "high", "auto"],
@@ -1347,6 +1367,7 @@ def main() -> None:
                lockin_period=args.period, lockin_integration=args.integration,
                lockin_invert=args.invert, fixed_range=fixed_range,
                log_scale=args.log, log_strength=args.log_strength,
+               show_timestamp=not args.no_timestamp,
                gain_mode=gain_mode, record=args.record,
                record_fps=args.record_fps).run()
     except RuntimeError as e:
