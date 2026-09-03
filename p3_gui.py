@@ -781,23 +781,27 @@ class P3GUI:
             return visible
         if visible is None:
             return thermal
-        return self._side_by_side(thermal, visible)
+        return self._stacked(thermal, visible)
 
     @staticmethod
-    def _side_by_side(
-        left: NDArray[np.uint8], right: NDArray[np.uint8], gap: int = 6
+    def _stacked(
+        top: NDArray[np.uint8], bottom: NDArray[np.uint8], gap: int = 6
     ) -> NDArray[np.uint8]:
-        """Join two frames at a common height.
+        """Stack two frames at a common width.
 
-        The webcam frame is far larger than the thermal one, so it is scaled to
-        the thermal frame's height rather than the other way round; upscaling
-        the thermal image to 1440 rows would cost time and add nothing.
+        Both feeds are landscape, so placing them side by side produces a very
+        wide, short image that wastes most of a normal window. Stacking keeps
+        each one as large as the window's width allows.
+
+        The webcam frame is scaled to the thermal frame's width rather than the
+        other way round; upscaling the thermal image would cost time and add
+        no detail.
         """
-        h = left.shape[0]
-        rw = max(1, int(right.shape[1] * h / right.shape[0]))
-        right = cv2.resize(right, (rw, h), interpolation=cv2.INTER_AREA)
-        divider = np.zeros((h, gap, 3), dtype=np.uint8)
-        return np.hstack([left, divider, right])
+        w = top.shape[1]
+        bh = max(1, int(bottom.shape[0] * w / bottom.shape[1]))
+        bottom = cv2.resize(bottom, (w, bh), interpolation=cv2.INTER_AREA)
+        divider = np.zeros((gap, w, 3), dtype=np.uint8)
+        return np.vstack([top, divider, bottom])
 
     def _show(self, frame: NDArray[np.uint8]) -> None:
         # Measure the container, never the Label: the Label's own size is a

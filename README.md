@@ -118,9 +118,10 @@ reconnects.
 #### View
 
 **View** switches the preview between **Both** (default), **Thermal** and
-**Visible**. Both shows the two feeds side by side, scaled to a common height. If
-one camera is unavailable the other is shown alone rather than the preview going
-blank.
+**Visible**. Both stacks the feeds vertically, thermal above visible, at a common
+width -- both cameras are landscape, so side by side would give a very wide, short
+image that wastes most of a window. If one camera is unavailable the other is shown
+alone rather than the preview going blank.
 
 Showing and recording the webcam are separate: the device is opened whenever it is
 being shown or recorded, and released when neither applies, so its light goes out

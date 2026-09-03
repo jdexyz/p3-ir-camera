@@ -198,12 +198,14 @@ THERMAL = np.full((768, 1024, 3), 60, dtype=np.uint8)
 VISIBLE = np.full((1440, 2560, 3), 200, dtype=np.uint8)
 
 
-def test_both_joins_side_by_side():
+def test_both_stacks_vertically():
+    """Both feeds are landscape, so they stack rather than sit side by side."""
     out = make_gui("both", THERMAL, VISIBLE)._compose()
-    assert out.shape[0] == 768, "should match the thermal frame's height"
-    # thermal + gap + webcam scaled to 768 rows (16:9 -> 1365 px)
-    assert out.shape[1] == 1024 + 6 + 1365
-    assert out[:, :1024].mean() == 60 and out[:, -1365:].mean() == 200
+    assert out.shape[1] == 1024, "should match the thermal frame's width"
+    # thermal + gap + webcam scaled to 1024 wide (16:9 -> 576 rows)
+    assert out.shape[0] == 768 + 6 + 576
+    assert out[:768].mean() == 60, "thermal on top"
+    assert out[-576:].mean() == 200, "visible below"
 
 
 def test_both_falls_back_when_visible_missing():
