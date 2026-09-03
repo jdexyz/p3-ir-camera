@@ -208,6 +208,7 @@ class P3GUI:
         # opens a frame later than the click, so "not recording yet" must not
         # be mistaken for "recording finished".
         self._record_intent = False
+        self._view_missing_note = ""
         self.uvc_devices: list[tuple[int, int, int]] = []
         self._uvc_preferred = uvc_index
 
@@ -317,11 +318,13 @@ class P3GUI:
         self.preview.place(relx=0.5, rely=0.5, anchor="center")
 
         self._build_connection(side)
+        self._build_view(side)
         self._build_record(side)
         self._build_visible(side)
         self._build_scale(side)
         self._build_camera(side)
         self._build_display(side)
+        self._sync_strength_enabled()
 
     def _build_connection(self, parent: tk.Widget) -> None:
         box = ttk.Labelframe(parent, text=" Camera link ", padding=10)
@@ -335,6 +338,27 @@ class P3GUI:
     def _reconnect(self) -> None:
         """Force a reconnect; also the manual recovery if auto-retry is stuck."""
         self.capture.request_reconnect()
+
+    def _build_view(self, parent: tk.Widget) -> None:
+        box = ttk.Labelframe(parent, text=" View ", padding=10)
+        box.pack(fill="x", padx=10, pady=6)
+        self.var_view = tk.StringVar(value="both")
+        row = ttk.Frame(box, style="Panel.TFrame")
+        row.pack(fill="x")
+        for i, (value, label) in enumerate(
+            (("both", "Both"), ("thermal", "Thermal"), ("visible", "Visible"))
+        ):
+            ttk.Radiobutton(row, text=label, value=value, variable=self.var_view,
+                            command=self._apply_view).grid(row=0, column=i,
+                                                           sticky="w", padx=(0, 10))
+
+    def _apply_view(self) -> None:
+        """Open or release the webcam to match what the view needs."""
+        self._ensure_uvc()
+
+    def _wants_visible(self) -> bool:
+        """The webcam is needed to show it, or to record it."""
+        return self.var_view.get() in ("both", "visible") or self.var_uvc_on.get()
 
     def _build_record(self, parent: tk.Widget) -> None:
         box = ttk.Labelframe(parent, text=" Recording ", padding=10)
@@ -407,27 +431,37 @@ class P3GUI:
         chosen = chosen or uvc.best_camera(devices)
         assert chosen is not None
         self.var_uvc_dev.set(uvc.describe(*chosen))
-        self.lbl_uvc.config(text=f"{len(devices)} found - not recording")
+        self.lbl_uvc.config(text=f"{len(devices)} found")
+        self._ensure_uvc()
 
     def _selected_uvc(self) -> tuple[int, int, int] | None:
         label = self.var_uvc_dev.get()
         return next((d for d in self.uvc_devices if uvc.describe(*d) == label), None)
 
     def _toggle_uvc(self) -> None:
-        if self.var_uvc_on.get():
-            self._select_uvc()
-        else:
-            self._close_uvc()
-            self.lbl_uvc.config(text="Off", foreground=FG_DIM)
+        self._ensure_uvc()
 
     def _select_uvc(self) -> None:
-        """(Re)open the chosen device, so it is warm before recording starts."""
-        if not self.var_uvc_on.get():
+        """Reopen after the device choice changes."""
+        self._close_uvc()
+        self._ensure_uvc()
+
+    def _ensure_uvc(self) -> None:
+        """Hold the webcam open exactly while it is being shown or recorded.
+
+        Previewing and recording are separate needs; the device is released
+        when neither applies so its light goes out and other apps can use it.
+        """
+        if not self._wants_visible():
+            if self.uvc_cam is not None and not self.uvc_cam.recording:
+                self._close_uvc()
+                self.lbl_uvc.config(text="Idle", foreground=FG_DIM)
+            return
+        if self.uvc_cam is not None:
             return
         device = self._selected_uvc()
         if device is None:
             return
-        self._close_uvc()
         index, w, h = device
         self.uvc_cam = uvc.UVCCamera(index=index, width=w, height=h,
                                      show_timestamp=self.var_stamp.get())
@@ -469,13 +503,17 @@ class P3GUI:
 
         srow = ttk.Frame(box, style="Panel.TFrame")
         srow.pack(fill="x", pady=(10, 0))
-        ttk.Label(srow, text="Log strength", style="Dim.TLabel").pack(side="left")
+        self.lbl_title_strength = ttk.Label(srow, text="Log strength",
+                                            style="Dim.TLabel")
+        self.lbl_title_strength.pack(side="left")
         self.lbl_strength = ttk.Label(srow, text=f"{self.viewer.log_strength:.0f}",
                                       style="Value.TLabel")
         self.lbl_strength.pack(side="right")
         self.var_strength = tk.DoubleVar(value=self.viewer.log_strength)
-        ttk.Scale(box, from_=1.0, to=400.0, variable=self.var_strength,
-                  command=self._apply_strength).pack(fill="x")
+        self.scale_strength = ttk.Scale(box, from_=1.0, to=400.0,
+                                        variable=self.var_strength,
+                                        command=self._apply_strength)
+        self.scale_strength.pack(fill="x")
 
         ttk.Button(box, text="Apply range",
                    command=self._apply_range).pack(fill="x", pady=(8, 0))
@@ -621,6 +659,21 @@ class P3GUI:
 
     def _apply_agc(self) -> None:
         self.viewer.agc_mode = AGCMode(self.var_agc.get())
+        self._sync_strength_enabled()
+
+    def _sync_strength_enabled(self) -> None:
+        """Grey the strength slider out unless it actually affects the image.
+
+        It only applies in LOG_RANGE. Left enabled in the linear modes it reads
+        as a live control that is being ignored, which is exactly how it looks
+        at startup when --log was not passed.
+        """
+        active = self.viewer.agc_mode == AGCMode.LOG_RANGE
+        self.scale_strength.state(["!disabled"] if active else ["disabled"])
+        self.lbl_strength.config(style="Value.TLabel" if active else "Dim.TLabel")
+        self.lbl_title_strength.config(
+            text="Log strength" if active else "Log strength (log mode only)"
+        )
 
     def _set_range(self, lo: float, hi: float) -> None:
         self.var_min.set(f"{lo:g}")
@@ -642,6 +695,7 @@ class P3GUI:
         if self.viewer.agc_mode != AGCMode.LOG_RANGE:
             self.var_agc.set(int(AGCMode.FIXED_RANGE))
             self.viewer.agc_mode = AGCMode.FIXED_RANGE
+        self._sync_strength_enabled()
         if hi > 150 and self.viewer.camera.gain_mode != GainMode.LOW:
             self.var_gain.set(int(GainMode.LOW))
             self._apply_gain()
@@ -650,10 +704,6 @@ class P3GUI:
         strength = float(self.var_strength.get())
         self.viewer.log_strength = strength
         self.lbl_strength.config(text=f"{strength:.0f}")
-        # The slider only means anything in log mode, so dragging it selects it.
-        if self.viewer.agc_mode != AGCMode.LOG_RANGE:
-            self.var_agc.set(int(AGCMode.LOG_RANGE))
-            self.viewer.agc_mode = AGCMode.LOG_RANGE
 
     def _apply_gain(self) -> None:
         mode = GainMode(self.var_gain.get())
@@ -688,8 +738,8 @@ class P3GUI:
     def _tick(self) -> None:
         # A camera error is no longer fatal: the capture thread reconnects on
         # its own, so the window stays up and reports what is happening.
-        frame = self.capture.latest()
-        if frame is not None and self.capture.state is State.STREAMING:
+        frame = self._compose()
+        if frame is not None:
             self._show(frame)
         self._update_connection()
         self._update_status()
@@ -714,6 +764,40 @@ class P3GUI:
                          "Reconnecting automatically...",
                 )
                 self._photo = None
+
+    def _compose(self) -> NDArray[np.uint8] | None:
+        """Build the preview image for the selected view."""
+        view = self.var_view.get()
+        thermal = (self.capture.latest()
+                   if self.capture.state is State.STREAMING else None)
+        visible = self.uvc_cam.latest() if self.uvc_cam is not None else None
+
+        if view == "thermal":
+            return thermal
+        if view == "visible":
+            return visible
+        # Both: fall back to whichever is available rather than showing nothing.
+        if thermal is None:
+            return visible
+        if visible is None:
+            return thermal
+        return self._side_by_side(thermal, visible)
+
+    @staticmethod
+    def _side_by_side(
+        left: NDArray[np.uint8], right: NDArray[np.uint8], gap: int = 6
+    ) -> NDArray[np.uint8]:
+        """Join two frames at a common height.
+
+        The webcam frame is far larger than the thermal one, so it is scaled to
+        the thermal frame's height rather than the other way round; upscaling
+        the thermal image to 1440 rows would cost time and add nothing.
+        """
+        h = left.shape[0]
+        rw = max(1, int(right.shape[1] * h / right.shape[0]))
+        right = cv2.resize(right, (rw, h), interpolation=cv2.INTER_AREA)
+        divider = np.zeros((h, gap, 3), dtype=np.uint8)
+        return np.hstack([left, divider, right])
 
     def _show(self, frame: NDArray[np.uint8]) -> None:
         # Measure the container, never the Label: the Label's own size is a

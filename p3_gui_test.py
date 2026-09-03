@@ -167,3 +167,70 @@ def test_stop_ends_thread(fast_retry):
     thread.join(timeout=5)
     assert not thread.is_alive()
     assert thread.state is State.STOPPED
+
+
+# --- preview composition ----------------------------------------------------
+
+
+class FakeUVC:
+    def __init__(self, frame=None) -> None:
+        self._frame = frame
+
+    def latest(self):
+        return self._frame
+
+
+def make_gui(view="both", thermal=None, visible=None, streaming=True):
+    """A P3GUI with only the attributes _compose touches."""
+    gui = p3_gui.P3GUI.__new__(p3_gui.P3GUI)
+    gui.var_view = type("V", (), {"get": lambda self, v=view: v})()
+    gui.capture = type(
+        "C", (), {
+            "state": State.STREAMING if streaming else State.RECONNECTING,
+            "latest": lambda self, f=thermal: f,
+        },
+    )()
+    gui.uvc_cam = FakeUVC(visible) if visible is not None else None
+    return gui
+
+
+THERMAL = np.full((768, 1024, 3), 60, dtype=np.uint8)
+VISIBLE = np.full((1440, 2560, 3), 200, dtype=np.uint8)
+
+
+def test_both_joins_side_by_side():
+    out = make_gui("both", THERMAL, VISIBLE)._compose()
+    assert out.shape[0] == 768, "should match the thermal frame's height"
+    # thermal + gap + webcam scaled to 768 rows (16:9 -> 1365 px)
+    assert out.shape[1] == 1024 + 6 + 1365
+    assert out[:, :1024].mean() == 60 and out[:, -1365:].mean() == 200
+
+
+def test_both_falls_back_when_visible_missing():
+    out = make_gui("both", THERMAL, None)._compose()
+    assert out.shape == THERMAL.shape
+
+
+def test_both_falls_back_when_thermal_missing():
+    """A disconnected thermal camera must not blank a working webcam."""
+    out = make_gui("both", None, VISIBLE)._compose()
+    assert out.shape == VISIBLE.shape
+
+
+def test_thermal_only_ignores_webcam():
+    out = make_gui("thermal", THERMAL, VISIBLE)._compose()
+    assert out.shape == THERMAL.shape
+
+
+def test_visible_only_ignores_thermal():
+    out = make_gui("visible", THERMAL, VISIBLE)._compose()
+    assert out.shape == VISIBLE.shape
+
+
+def test_visible_only_without_camera_is_none():
+    assert make_gui("visible", THERMAL, None)._compose() is None
+
+
+def test_thermal_dropped_while_reconnecting():
+    """A stale frame must not be shown as if it were live."""
+    assert make_gui("thermal", THERMAL, None, streaming=False)._compose() is None

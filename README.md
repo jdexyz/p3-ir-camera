@@ -115,6 +115,17 @@ A recording running when the link drops is finalized rather than abandoned, so i
 disconnect. Recording does not resume by itself -- start it again once the camera
 reconnects.
 
+#### View
+
+**View** switches the preview between **Both** (default), **Thermal** and
+**Visible**. Both shows the two feeds side by side, scaled to a common height. If
+one camera is unavailable the other is shown alone rather than the preview going
+blank.
+
+Showing and recording the webcam are separate: the device is opened whenever it is
+being shown or recorded, and released when neither applies, so its light goes out
+and other applications can use it.
+
 #### Visible camera
 
 Tick **Record visible alongside thermal** to record a USB (UVC) webcam at the same
@@ -181,7 +192,9 @@ Display value for a 20-350 C scale:
 | 350 C | 254/255 | 254/255 | 254/255 |
 
 `--log-strength` (default 50) sets the curve: lower approaches linear, higher lifts the
-cool end further. The colorbar tick labels follow the same curve, so temperatures still
+cool end further. It applies only in log mode -- in the GUI the slider is greyed out
+in the linear modes, since a live-looking control that changes nothing reads as a
+bug. Select **Log range** and the strength shown takes effect immediately. The colorbar tick labels follow the same curve, so temperatures still
 read off correctly -- the ticks are just no longer evenly spaced in temperature.
 
 The curve is applied to position within the range, not to absolute temperature: a true
