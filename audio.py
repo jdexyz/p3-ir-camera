@@ -153,13 +153,19 @@ class AudioRecorder(threading.Thread):
             self.error = str(e)
 
 
+# H.264 at this quality is a fraction of the size of what VideoWriter emits,
+# and these are working recordings rather than masters.
+DEFAULT_CRF = 23
+
+
 def mux(
     video: str,
-    audio: str,
+    audio: str | None,
     output: str,
-    timeout: float = 120.0,
+    timeout: float = 600.0,
     timescale: float = 1.0,
     audio_skip: float = 0.0,
+    crf: int = DEFAULT_CRF,
 ) -> str | None:
     """Combine a video file and a WAV into one mp4, correcting drift.
 
@@ -174,8 +180,9 @@ def mux(
       recording is pressed, but the video writer cannot open until a frame has
       arrived to size it, so the sound leads the picture by that gap.
 
-    The video stream is copied rather than re-encoded, so this costs little and
-    cannot degrade the recording.
+    The video is re-encoded to H.264, which is a fraction of the size of what
+    OpenCV's writer emits. Passing `audio=None` runs the same pass without a
+    sound track, so every recording gets the same treatment.
 
     Returns:
         An error string, or None on success.
@@ -187,15 +194,20 @@ def mux(
     if abs(timescale - 1.0) > 1e-6:
         cmd += ["-itsscale", f"{timescale:.6f}"]
     cmd += ["-i", video]
-    if audio_skip > 0.001:
-        cmd += ["-ss", f"{audio_skip:.3f}"]
+    if audio is not None:
+        if audio_skip > 0.001:
+            # -ss before the input seeks within that input only.
+            cmd += ["-ss", f"{audio_skip:.3f}"]
+        cmd += ["-i", audio]
     cmd += [
-        "-i", audio,
-        "-c:v", "copy",
-        "-c:a", "aac",
-        "-shortest",
-        output,
+        "-c:v", "libx264",
+        "-crf", str(crf),
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
     ]
+    if audio is not None:
+        cmd += ["-c:a", "aac", "-shortest"]
+    cmd += [output]
     try:
         done = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
     except Exception as e:

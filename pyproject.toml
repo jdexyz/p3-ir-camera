@@ -48,6 +48,7 @@ p3-viewer = "p3_viewer:main"
 # gui-scripts builds a pythonw-based launcher, so no console window appears.
 [project.gui-scripts]
 p3-gui = "p3_gui:main"
+p3-replay = "replay:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -55,7 +56,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 include = ["p3_camera.py", "p3_viewer.py", "p3_gui.py", "lockin.py",
-           "uvc.py", "audio.py", "overlay.py"]
+           "uvc.py", "audio.py", "overlay.py", "replay.py"]
 
 [tool.ruff]
 fix = true

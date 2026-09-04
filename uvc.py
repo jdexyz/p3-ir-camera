@@ -30,7 +30,7 @@ BACKEND = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
 # range and clamp anything outside it, so the exact bounds are the device's
 # business, not ours.
 FOCUS_MIN = 0
-FOCUS_MAX = 260
+FOCUS_MAX = 1000
 FOCUS_STEP = 10
 
 

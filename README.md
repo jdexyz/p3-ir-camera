@@ -175,6 +175,25 @@ if present. If either is missing the capture still runs -- the sound is simply l
 `audio.wav` beside the video, and the sidecar says so. Muxing uses `-shortest`, so the
 combined file is as long as the shorter of the two streams.
 
+### Replay
+
+```bash
+p3-replay                 # pick a session folder
+p3-replay path/to/run01   # or open one directly
+```
+
+Also reachable from the GUI's **Replay a recording...** button. Plays a session back
+with sound, and **clicking the thermal image reads the temperature at that point**.
+
+The thermal pane is rendered from `thermal.raw`, not from the recorded video: the
+video holds 8-bit colour-mapped pixels, while the raw stream holds the sensor's own
+counts. Only the raw data can answer what temperature a point was, and only it maps
+cleanly back to a sensor pixel, so the probe is exact rather than inferred from
+colours. The visible pane and the sound come from `combined.mp4`.
+
+Playback is driven from the wall clock rather than by counting frames, so the picture
+keeps pace with the sound instead of drifting behind it.
+
 ### Viewer
 
 ```bash
@@ -258,6 +277,12 @@ run01/
 `combined.mp4` is written frame-for-frame from the thermal capture loop, taking
 whatever the webcam last delivered. Both feeds therefore share one clock and the
 file has a single consistent rate for the sound to align against.
+
+Every recording is finalized through ffmpeg, which re-encodes to H.264 and corrects
+the timing. These are working recordings rather than masters, so the default quality
+(CRF 23) trades some compression artefacts for roughly a third of the size -- a
+measured session went from 2.44 MB to 1.08 MB. The 16-bit `thermal.raw` is never
+touched, so measurements stay exact.
 
 `p3-viewer --record BASE` writes the same thermal trio without a folder, as
 `BASE.mp4` / `BASE.raw` / `BASE.json`, and `R` toggles recording at runtime.

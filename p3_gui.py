@@ -217,6 +217,8 @@ class P3GUI:
         self._combined: cv2.VideoWriter | None = None
         self._combined_size: tuple[int, int] | None = None
         self._combined_frames = 0
+        self._combined_split = 0
+        self._combined_pending: str | None = None
         self._combined_start = 0.0
         self._combined_end = 0.0
         self.uvc_devices: list[tuple[int, int, int]] = []
@@ -399,6 +401,8 @@ class P3GUI:
 
         ttk.Button(box, text="Snapshot (PNG + raw)",
                    command=self._snapshot).pack(fill="x", pady=(8, 0))
+        ttk.Button(box, text="Replay a recording...",
+                   command=self._open_replay).pack(fill="x", pady=(6, 0))
 
     def _build_visible(self, parent: tk.Widget) -> None:
         box = ttk.Labelframe(parent, text=" Visible camera ", padding=10)
@@ -561,11 +565,13 @@ class P3GUI:
         box.pack(fill="x", padx=10, pady=6)
 
         self.var_agc = tk.IntVar(value=int(self.viewer.agc_mode))
+        # Log first: it is the default, and the one that shows ambient detail
+        # and a hot target at the same time.
         for mode, label in (
+            (AGCMode.LOG_RANGE, "Log range (absolute)"),
+            (AGCMode.FIXED_RANGE, "Fixed range (absolute)"),
             (AGCMode.FACTORY, "Factory AGC (auto)"),
             (AGCMode.TEMPORAL_1, "Percentile (auto)"),
-            (AGCMode.FIXED_RANGE, "Fixed range (absolute)"),
-            (AGCMode.LOG_RANGE, "Log range (absolute)"),
         ):
             ttk.Radiobutton(box, text=label, value=int(mode), variable=self.var_agc,
                             command=self._apply_agc).pack(anchor="w")
@@ -676,6 +682,10 @@ class P3GUI:
 
     # -- actions ----------------------------------------------------------
 
+    def _open_replay(self) -> None:
+        import replay
+        replay.open_session(self.root)
+
     def _pick_dir(self) -> None:
         d = filedialog.askdirectory(initialdir=self.var_dir.get())
         if d:
@@ -744,9 +754,11 @@ class P3GUI:
         feeds share a single clock and the file has one consistent rate to
         align the sound against.
         """
-        if self._combined is None:
-            return
         visible = self.uvc_cam.latest() if self.uvc_cam is not None else None
+        if self._combined is None:
+            self._open_combined_now(thermal, visible)
+            if self._combined is None:
+                return
         frame = self._stacked(thermal, visible) if visible is not None else thermal
         w, h = self._combined_size or (0, 0)
         if (frame.shape[1], frame.shape[0]) != (w, h):
@@ -756,11 +768,19 @@ class P3GUI:
         self._combined_end = when or time.time()
 
     def _open_combined(self, session: str) -> None:
-        """Size and open the combined writer from the frames available now."""
-        thermal = self.capture.latest()
-        if thermal is None:
+        """Arm the combined writer; it opens on the first frame that arrives.
+
+        Deferred rather than opened here because recording can be started while
+        the thermal camera is still connecting, and a writer that gives up at
+        that moment would silently produce no file at all.
+        """
+        self._combined_pending = session
+        self.viewer.frame_hook = self._combined_frame
+
+    def _open_combined_now(self, thermal, visible) -> None:
+        session, self._combined_pending = self._combined_pending, None
+        if session is None:
             return
-        visible = self.uvc_cam.latest() if self.uvc_cam is not None else None
         sample = self._stacked(thermal, visible) if visible is not None else thermal
         h, w = sample.shape[:2]
         writer = cv2.VideoWriter(
@@ -771,13 +791,16 @@ class P3GUI:
             return
         self._combined = writer
         self._combined_size = (w, h)
+        # Where the thermal pane ends, so replay can crop the visible pane
+        # without having to re-derive the layout.
+        self._combined_split = thermal.shape[0]
         self._combined_frames = 0
         self._combined_start = time.time()
         self._combined_end = self._combined_start
-        self.viewer.frame_hook = self._combined_frame
 
     def _close_combined(self) -> dict[str, object]:
         self.viewer.frame_hook = None
+        self._combined_pending = None
         writer, self._combined = self._combined, None
         if writer is None:
             return {}
@@ -785,6 +808,7 @@ class P3GUI:
         span = max(self._combined_end - self._combined_start, 1e-6)
         return {
             "file": "combined.mp4",
+            "thermal_pane_height": self._combined_split,
             "frames": self._combined_frames,
             "declared_fps": self.viewer.record_fps,
             "measured_fps": round(self._combined_frames / span, 3),
@@ -828,8 +852,11 @@ class P3GUI:
         """
         video = os.path.join(session, "combined.mp4")
         sound = os.path.join(session, "audio.wav")
-        if not (video_meta and os.path.exists(video) and os.path.exists(sound)):
+        if not (video_meta and os.path.exists(video)):
             return
+        # Without sound the pass still runs, to compress and to correct drift.
+        if not os.path.exists(sound):
+            sound = None
 
         # The writer was told a frame rate before the first frame existed, so
         # the container's rate is a guess. Rescale to what was really captured,
@@ -853,9 +880,12 @@ class P3GUI:
             if error is None and os.path.exists(merged):
                 try:
                     os.replace(merged, video)
-                    os.remove(sound)
-                    note = (f"combined.mp4 with sound "
-                            f"({measured:.1f} fps, {skip * 1000:.0f} ms offset)")
+                    if sound:
+                        os.remove(sound)
+                    size = os.path.getsize(video) / 1e6
+                    note = (f"combined.mp4 {size:.1f} MB "
+                            f"({measured:.1f} fps"
+                            + (f", {skip * 1000:.0f} ms offset)" if sound else ")"))
                 except OSError as e:
                     note = f"mux kept separate: {e}"
             else:
