@@ -38,6 +38,7 @@ from p3_viewer import (
 )
 
 import audio
+import thermal_store
 
 
 BG = "#1e1f22"
@@ -61,10 +62,12 @@ class Session:
         frames, rows, cols = self.meta["raw_shape"]
         raw_path = os.path.join(folder, os.path.basename(self.meta["raw_file"]))
         if not os.path.exists(raw_path):
-            raw_path = os.path.join(folder, "thermal.raw")
-        self.raw: NDArray[np.uint16] = np.memmap(
-            raw_path, dtype=self.meta.get("raw_dtype", "<u2"), mode="r"
-        ).reshape(frames, rows, cols)
+            # Fall back across formats so a session recorded either way opens.
+            for candidate in ("thermal.tz", "thermal.raw"):
+                if os.path.exists(os.path.join(folder, candidate)):
+                    raw_path = os.path.join(folder, candidate)
+                    break
+        self.raw = thermal_store.open_frames(raw_path, (frames, rows, cols))
         self.frames = int(frames)
         self.rows = int(rows)
         self.cols = int(cols)
@@ -98,12 +101,15 @@ class Session:
     def duration(self) -> float:
         return self.frames / self.fps
 
+    def frame(self, index: int) -> NDArray[np.uint16]:
+        """One thermal frame, whichever storage format it came from."""
+        return np.asarray(self.raw[int(np.clip(index, 0, self.frames - 1))])
+
     def temperature(self, frame: int, row: int, col: int) -> float:
         """Temperature in Celsius at one sensor pixel of one frame."""
-        frame = int(np.clip(frame, 0, self.frames - 1))
         row = int(np.clip(row, 0, self.rows - 1))
         col = int(np.clip(col, 0, self.cols - 1))
-        return float(raw_to_celsius(self.raw[frame, row, col]))
+        return float(raw_to_celsius(self.frame(frame)[row, col]))
 
 
 class AudioPlayer:
@@ -236,7 +242,7 @@ class ReplayWindow:
     def _render_thermal(self) -> NDArray[np.uint8]:
         """Colour-map the raw frame using the session's own AGC settings."""
         s = self.session
-        frame = np.asarray(s.raw[self.index])
+        frame = np.asarray(s.frame(self.index))
         if s.agc_mode == AGCMode.LOG_RANGE:
             img = agc_log(frame, *s.fixed_range, strength=s.log_strength)
         else:
@@ -299,7 +305,7 @@ class ReplayWindow:
 
         t = self.index / self.session.fps
         self.lbl_time.config(text=f"{t:5.1f}s / {self.session.duration:.1f}s")
-        frame = np.asarray(self.session.raw[self.index])
+        frame = np.asarray(self.session.frame(self.index))
         self.status.config(
             text=f"Frame {self.index + 1}/{self.session.frames}   |   "
                  f"Scene {raw_to_celsius(frame.min()):.1f}-"

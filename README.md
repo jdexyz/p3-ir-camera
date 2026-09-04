@@ -269,9 +269,36 @@ only make sense together stay together:
 run01/
   combined.mp4    Both feeds stacked in one file, with sound
   thermal.mp4     Thermal feed alone -- colormap, overlays, colorbar
-  thermal.raw     16-bit little-endian frames, pre-TNR sensor counts
+  thermal.tz      16-bit frames, pre-TNR sensor counts, block-compressed
   thermal.json    Frame counts, start times, measured rates, gain/AGC, emissivity
   audio.wav       Only if muxing was unavailable
+```
+
+#### Thermal storage
+
+A plain 16-bit stream is about 150 MB per minute. Consecutive thermal frames are
+nearly identical, so `thermal.tz` stores each frame as its difference from the one
+before and compresses that with zstd -- **8.3x smaller on a measured session, and
+exactly lossless**, taking 147 MB/min down to 18 MB/min. Encoding runs about 10x
+faster than real time, so it keeps up with capture comfortably.
+
+Compression usually costs random access, which replay needs for scrubbing. Frames
+are therefore grouped into one-second blocks with an index, so seeking decompresses
+a single block (~11 ms) rather than the whole recording. Sequential playback pays
+that once per block.
+
+The bottom two bits are dropped before compressing, which is lossless for this
+sensor: the P3 only ever emits multiples of 4, so its real quantum is 0.0625 C
+rather than the 1/64 C the format implies.
+
+`--no-compress` writes a plain `.raw` instead. Both formats open in replay and via
+`thermal_store.open_frames`, so existing recordings keep working:
+
+```python
+import json, thermal_store
+meta = json.load(open("run01/thermal.json"))
+frames = thermal_store.open_frames("run01/thermal.tz")
+celsius = frames[42] / 64.0 - 273.15      # frame 42, as degrees C
 ```
 
 `combined.mp4` is written frame-for-frame from the thermal capture loop, taking
@@ -296,11 +323,12 @@ visible in the mp4 only. Frame *i* of the mp4 corresponds to frame *i* of the ra
 Read it back with the shape from the sidecar:
 
 ```python
-import json, numpy as np
+import json, thermal_store
 meta = json.load(open("run01/thermal.json"))
-n, rows, cols = meta["raw_shape"]
-raw = np.memmap("run01/thermal.raw", dtype="<u2", mode="r").reshape(n, rows, cols)
-celsius = raw / 64.0 - 273.15
+frames = thermal_store.open_frames(
+    "run01/" + meta["raw_file"], meta["raw_shape"]
+)
+celsius = frames[0] / 64.0 - 273.15
 ```
 
 #### Timestamp

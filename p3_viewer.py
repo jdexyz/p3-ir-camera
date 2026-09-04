@@ -25,20 +25,20 @@ from typing import Any, cast
 
 import json
 import logging
+import os
+import threading
 import time
 
 from numpy.typing import NDArray
 
 import cv2
-import numpy as np
-import threading
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
 
 from lockin import LockInController
 from overlay import draw_timestamp
-
 from p3_camera import (
     GainMode,
     Model,
@@ -47,6 +47,8 @@ from p3_camera import (
     raw_to_celsius,
     raw_to_celsius_corrected,
 )
+
+import thermal_store
 
 
 # =============================================================================
@@ -387,7 +389,7 @@ class P3Viewer:
                  lockin_integration: float = 60.0, lockin_invert: bool = False,
                  fixed_range: tuple[float, float] | None = None,
                  log_scale: bool = True, log_strength: float = 50.0,
-                 show_timestamp: bool = True,
+                 show_timestamp: bool = True, compress_raw: bool = True,
                  gain_mode: GainMode | None = None,
                  record: str | None = None, record_fps: float = 25.0) -> None:
         """Initialize viewer.
@@ -401,6 +403,8 @@ class P3Viewer:
             fixed_range: (min_c, max_c) bounds for the absolute AGC modes.
                 Selects FIXED_RANGE (or LOG_RANGE) at startup when given.
             show_timestamp: Burn a date/time stamp into the rendered image.
+            compress_raw: Store the thermal stream block-compressed rather than
+                as a plain .raw file. Lossless, and roughly eight times smaller.
             log_scale: Use the logarithmic mapping for fixed_range (default).
             log_strength: Log curve strength; higher lifts the cool end more.
             gain_mode: Sensor gain mode to apply at startup. LOW is required
@@ -436,6 +440,7 @@ class P3Viewer:
             self.fixed_range = fixed_range
             self.agc_mode = AGCMode.LOG_RANGE if log_scale else AGCMode.FIXED_RANGE
         self.log_strength: float = log_strength
+        self.compress_raw: bool = compress_raw
         self.startup_gain_mode: GainMode | None = gain_mode
         # Recording state
         self.record_fps: float = record_fps
@@ -1142,13 +1147,24 @@ class P3Viewer:
             print(f"Failed to open video writer for {base}.mp4")
             return
 
+        # _start_recording only runs after a frame has been rendered, so the
+        # sensor geometry is known.
+        assert self._last_thermal is not None
+        rows, cols = self._last_thermal.shape
+        if self.compress_raw:
+            self._rec_raw = thermal_store.ThermalWriter(f"{base}.tz", rows, cols)
+            thermal_name = f"{base}.tz"
+        else:
+            self._rec_raw = thermal_store.RawWriter(f"{base}.raw", rows, cols)
+            thermal_name = f"{base}.raw"
+
         self._rec_video = writer
-        self._rec_raw = open(f"{base}.raw", "wb")
         self._record_base = base
         self._rec_count = 0
         self._rec_shape = None
         self._rec_start = time.time()
-        print(f"Recording: {base}.mp4 + {base}.raw ({w}x{h} @ {self.record_fps:g} fps)")
+        print(f"Recording: {base}.mp4 + {os.path.basename(thermal_name)} "
+              f"({w}x{h} @ {self.record_fps:g} fps)")
 
     def _record_frame(
         self, raw_thermal: NDArray[np.uint16], display: NDArray[np.uint8]
@@ -1157,8 +1173,8 @@ class P3Viewer:
         if self._rec_raw is None:
             return
 
-        # Raw is pre-TNR sensor data, native byte order forced to little-endian.
-        self._rec_raw.write(np.ascontiguousarray(raw_thermal, dtype="<u2").tobytes())
+        # Pre-TNR sensor data: the measurement stream, never the filtered one.
+        self._rec_raw.write(raw_thermal)
         if self._rec_shape is None:
             self._rec_shape = (int(raw_thermal.shape[0]), int(raw_thermal.shape[1]))
 
@@ -1179,6 +1195,7 @@ class P3Viewer:
 
         base = self._record_base or "p3_rec"
         elapsed = time.time() - self._rec_start
+        thermal_file = os.path.basename(getattr(self._rec_raw, "path", ""))
         self._rec_raw.close()
         self._rec_raw = None
         if self._rec_video is not None:
@@ -1196,7 +1213,8 @@ class P3Viewer:
             "duration_s": round(elapsed, 3),
             "measured_fps": round(self._rec_count / elapsed, 3) if elapsed > 0 else 0.0,
             "video_fps": self.record_fps,
-            "raw_file": f"{base}.raw",
+            "raw_file": thermal_file,
+            "raw_format": "p3tz" if self.compress_raw else "raw",
             "raw_dtype": "<u2",
             "raw_shape": [self._rec_count, rows, cols],
             "raw_note": "Pre-TNR sensor counts; raw/64 - 273.15 = degrees C.",
@@ -1338,6 +1356,12 @@ def main() -> None:
         help="Log curve strength; higher lifts the cool end more (default: 50)",
     )
     parser.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Store the thermal stream as a plain .raw file instead of the "
+             "block-compressed .tz (lossless, about eight times larger)",
+    )
+    parser.add_argument(
         "--no-timestamp",
         action="store_true",
         help="Do not burn a date/time stamp into the rendered image and mp4",
@@ -1383,6 +1407,7 @@ def main() -> None:
                lockin_invert=args.invert, fixed_range=fixed_range,
                log_scale=not args.linear, log_strength=args.log_strength,
                show_timestamp=not args.no_timestamp,
+               compress_raw=not args.no_compress,
                gain_mode=gain_mode, record=args.record,
                record_fps=args.record_fps).run()
     except RuntimeError as e:

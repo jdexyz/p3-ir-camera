@@ -1191,6 +1191,9 @@ def main() -> None:
     parser.add_argument("--log-strength", type=float, default=50.0,
                         help="Log curve strength; higher lifts the cool end "
                              "more (default: 50)")
+    parser.add_argument("--no-compress", action="store_true",
+                        help="Store the thermal stream as a plain .raw file "
+                             "instead of the block-compressed .tz")
     parser.add_argument("--no-timestamp", action="store_true",
                         help="Do not burn a date/time stamp into the video")
     parser.add_argument("--uvc", type=int, default=None, metavar="INDEX",
@@ -1215,6 +1218,7 @@ def main() -> None:
         log_scale=args.log,
         log_strength=args.log_strength,
         show_timestamp=not args.no_timestamp,
+        compress_raw=not args.no_compress,
         gain_mode=GainMode[args.gain.upper()] if args.gain else None,
         record_fps=args.record_fps,
     )
