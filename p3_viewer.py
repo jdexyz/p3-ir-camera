@@ -447,6 +447,10 @@ class P3Viewer:
         # Merged into the recording sidecar; lets a caller record a companion
         # stream (e.g. a visible-light camera) alongside the thermal data.
         self.extra_metadata: dict[str, Any] = {}
+        # Called with (rendered frame, capture time) for every recorded frame.
+        # Lets a caller write a second video in step with this one, driven by
+        # the same clock rather than by a timer of its own.
+        self.frame_hook: Any = None
         self._rec_video: cv2.VideoWriter | None = None
         self._rec_raw: Any = None
         self._rec_size: tuple[int, int] | None = None
@@ -522,6 +526,11 @@ class P3Viewer:
             self._start_recording(self._pending_record)
             self._pending_record = None
         self._record_frame(raw_thermal, self._last_display)
+        if self.frame_hook is not None and self._rec_raw is not None:
+            try:
+                self.frame_hook(self._last_display, self._frame_time)
+            except Exception as e:  # a companion writer must not stop capture
+                print(f"Frame hook failed: {e}")
         self._update_fps()
         return self._last_display
 
@@ -1183,6 +1192,7 @@ class P3Viewer:
             "started_at": time.strftime(
                 "%Y-%m-%dT%H:%M:%S", time.localtime(self._rec_start)
             ),
+            "started_at_epoch": round(self._rec_start, 3),
             "duration_s": round(elapsed, 3),
             "measured_fps": round(self._rec_count / elapsed, 3) if elapsed > 0 else 0.0,
             "video_fps": self.record_fps,

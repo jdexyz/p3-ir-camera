@@ -9,6 +9,7 @@ is enough to align them afterwards.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
@@ -19,6 +20,38 @@ import numpy as np
 
 from overlay import draw_timestamp
 
+
+# DirectShow rather than the Windows default of Media Foundation: MSMF accepts
+# focus writes, returns success, and silently ignores them, while DirectShow
+# actually drives the lens. Both handle this camera's full resolution.
+BACKEND = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+
+# Focus values this class will emit. UVC cameras expose a coarse, quantised
+# range and clamp anything outside it, so the exact bounds are the device's
+# business, not ours.
+FOCUS_MIN = 0
+FOCUS_MAX = 260
+FOCUS_STEP = 10
+
+
+def _open(index: int) -> tuple[cv2.VideoCapture | None, bool]:
+    """Open a camera, preferring the backend that supports focus.
+
+    Returns (capture, using_preferred). Falling back matters because the
+    preferred backend can fail to open a device that the default one still
+    handles; capturing without focus control beats not capturing.
+    """
+    cap = cv2.VideoCapture(index, BACKEND)
+    if cap.isOpened():
+        return cap, True
+    cap.release()
+    if BACKEND == cv2.CAP_ANY:
+        return None, False
+    cap = cv2.VideoCapture(index, cv2.CAP_ANY)
+    if cap.isOpened():
+        return cap, False
+    cap.release()
+    return None, False
 
 # Opening a camera costs ~1-2 s per index, so probing is deliberately shallow.
 MAX_PROBE_INDEX = 4
@@ -50,10 +83,10 @@ def list_cameras(max_index: int = MAX_PROBE_INDEX) -> list[tuple[int, int, int]]
     """
     found: list[tuple[int, int, int]] = []
     for index in range(max_index):
-        cap = cv2.VideoCapture(index)
+        cap, _preferred = _open(index)
+        if cap is None:
+            continue
         try:
-            if not cap.isOpened():
-                continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, _PROBE_REQUEST[0])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _PROBE_REQUEST[1])
             ok, frame = cap.read()
@@ -96,6 +129,8 @@ class UVCCamera(threading.Thread):
         width: int | None = None,
         height: int | None = None,
         show_timestamp: bool = True,
+        autofocus: bool = True,
+        focus: int | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.index = index
@@ -121,6 +156,14 @@ class UVCCamera(threading.Thread):
         self._last_meta: dict[str, object] = {}
         self._stop = threading.Event()
         self._lock = threading.Lock()
+
+        # Focus is applied on the grab thread, which owns the capture handle.
+        self._pending_autofocus: bool | None = autofocus
+        self._pending_focus: int | None = focus
+        self.autofocus = autofocus
+        self.focus: float | None = None
+        self.focus_supported = False
+        self.focus_backend = True
 
     # -- public API -------------------------------------------------------
 
@@ -165,9 +208,22 @@ class UVCCamera(threading.Thread):
             "device_index": self.index,
             "video_fps": self.fps,
             "timestamped": self.show_timestamp,
+            "autofocus": self.autofocus,
+            "focus": self.focus,
         }
         self._last_meta = meta
         return meta
+
+    def set_autofocus(self, enabled: bool) -> None:
+        """Queue an autofocus change for the grab thread."""
+        with self._lock:
+            self._pending_autofocus = enabled
+            self.autofocus = enabled
+
+    def set_focus(self, value: int) -> None:
+        """Queue a manual focus position for the grab thread."""
+        with self._lock:
+            self._pending_focus = int(value)
 
     def stop(self) -> None:
         self._stop.set()
@@ -176,18 +232,21 @@ class UVCCamera(threading.Thread):
 
     def run(self) -> None:
         try:
-            cap = cv2.VideoCapture(self.index)
-            if self.width and self.height:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            if not cap.isOpened():
+            cap, preferred = _open(self.index)
+            if cap is None:
                 self.error = f"Could not open UVC camera {self.index}"
                 self.opened.set()
                 return
+            self.focus_backend = preferred
+            if self.width and self.height:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             if not self._fps_explicit:
                 reported = cap.get(cv2.CAP_PROP_FPS)
                 if 1.0 < reported < 240.0:
                     self.fps = float(reported)
+            # A camera that reports a focus position has a driveable lens.
+            self.focus_supported = cap.get(cv2.CAP_PROP_FOCUS) >= 0
             self._cap = cap
             self.opened.set()
 
@@ -206,6 +265,7 @@ class UVCCamera(threading.Thread):
                     time.sleep(0.02)
                     continue
                 last_ok = time.time()
+                self._apply_focus(cap)
                 captured = time.time()
                 with self._lock:
                     self._frame = frame
@@ -226,6 +286,24 @@ class UVCCamera(threading.Thread):
                 self._cap.release()
 
     # -- internals --------------------------------------------------------
+
+    def _apply_focus(self, cap: cv2.VideoCapture) -> None:
+        """Push any queued focus change, then read back what the lens took.
+
+        The device arbitrates: it quantises manual values and moves the lens
+        itself while autofocus is on, so the read-back is the truth rather than
+        whatever was requested.
+        """
+        with self._lock:
+            autofocus, self._pending_autofocus = self._pending_autofocus, None
+            focus, self._pending_focus = self._pending_focus, None
+
+        if autofocus is not None:
+            cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if autofocus else 0)
+        if focus is not None and not self.autofocus:
+            cap.set(cv2.CAP_PROP_FOCUS, float(focus))
+        if autofocus is not None or focus is not None or self._count % 30 == 0:
+            self.focus = cap.get(cv2.CAP_PROP_FOCUS)
 
     def _open_pending_writer(self, frame: NDArray[np.uint8]) -> None:
         """Open the writer once a real frame has sized it. Caller holds lock."""

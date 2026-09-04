@@ -214,6 +214,11 @@ class P3GUI:
         self._session_dir: str | None = None
         self._mux_thread: threading.Thread | None = None
         self._closing = False
+        self._combined: cv2.VideoWriter | None = None
+        self._combined_size: tuple[int, int] | None = None
+        self._combined_frames = 0
+        self._combined_start = 0.0
+        self._combined_end = 0.0
         self.uvc_devices: list[tuple[int, int, int]] = []
         self._uvc_preferred = uvc_index
 
@@ -330,6 +335,7 @@ class P3GUI:
         self._build_camera(side)
         self._build_display(side)
         self._sync_strength_enabled()
+        self._sync_focus_enabled()
 
     def _build_connection(self, parent: tk.Widget) -> None:
         box = ttk.Labelframe(parent, text=" Camera link ", padding=10)
@@ -413,6 +419,24 @@ class P3GUI:
                                  style="Dim.TLabel")
         self.lbl_uvc.pack(anchor="w", pady=(8, 0))
 
+        self.var_af = tk.BooleanVar(value=True)
+        ttk.Checkbutton(box, text="Autofocus", variable=self.var_af,
+                        command=self._apply_autofocus).pack(anchor="w",
+                                                            pady=(10, 0))
+        frow = ttk.Frame(box, style="Panel.TFrame")
+        frow.pack(fill="x")
+        self.lbl_focus_title = ttk.Label(frow, text="Focus (manual only)",
+                                         style="Dim.TLabel")
+        self.lbl_focus_title.pack(side="left")
+        self.lbl_focus = ttk.Label(frow, text="-", style="Dim.TLabel")
+        self.lbl_focus.pack(side="right")
+        self.var_focus = tk.DoubleVar(value=150.0)
+        self.scale_focus = ttk.Scale(
+            box, from_=uvc.FOCUS_MIN, to=uvc.FOCUS_MAX,
+            variable=self.var_focus, command=self._apply_focus,
+        )
+        self.scale_focus.pack(fill="x")
+
         self.var_audio_on = tk.BooleanVar(value=audio.available())
         ttk.Checkbutton(box, text="Record sound", variable=self.var_audio_on,
                         command=self._sync_audio_enabled).pack(anchor="w",
@@ -434,6 +458,25 @@ class P3GUI:
         # Probing opens each device in turn and costs a second or two, so it
         # must not block the window from appearing.
         threading.Thread(target=self._probe_uvc, daemon=True).start()
+
+    def _apply_autofocus(self) -> None:
+        if self.uvc_cam is not None:
+            self.uvc_cam.set_autofocus(self.var_af.get())
+        self._sync_focus_enabled()
+
+    def _apply_focus(self, _value: str | None = None) -> None:
+        """Snap to the device's step so the slider cannot chase a clamped value."""
+        value = int(round(self.var_focus.get() / uvc.FOCUS_STEP) * uvc.FOCUS_STEP)
+        if self.uvc_cam is not None and not self.var_af.get():
+            self.uvc_cam.set_focus(value)
+
+    def _sync_focus_enabled(self) -> None:
+        """The focus slider does nothing while the camera is driving the lens."""
+        manual = not self.var_af.get()
+        self.scale_focus.state(["!disabled"] if manual else ["disabled"])
+        self.lbl_focus_title.config(
+            text="Focus" if manual else "Focus (manual only)"
+        )
 
     def _sync_audio_enabled(self) -> None:
         usable = audio.available() and bool(self.audio_inputs)
@@ -498,8 +541,12 @@ class P3GUI:
         if device is None:
             return
         index, w, h = device
-        self.uvc_cam = uvc.UVCCamera(index=index, width=w, height=h,
-                                     show_timestamp=self.var_stamp.get())
+        self.uvc_cam = uvc.UVCCamera(
+            index=index, width=w, height=h,
+            show_timestamp=self.var_stamp.get(),
+            autofocus=self.var_af.get(),
+            focus=int(self.var_focus.get()),
+        )
         self.uvc_cam.start()
         self.lbl_uvc.config(text=f"Opening camera {index}...", foreground=FG_DIM)
 
@@ -639,14 +686,16 @@ class P3GUI:
             # Finalize the companion streams first so their metadata makes it
             # into the sidecar, which _stop_recording writes.
             self._record_intent = False
-            had_video = self.uvc_cam is not None and self.uvc_cam.recording
+            combined = self._close_combined()
             self._stop_uvc_recording()
             sound = self._stop_audio()
+            if combined:
+                self.viewer.extra_metadata["combined"] = combined
             if sound:
                 self.viewer.extra_metadata.setdefault("audio", sound)
             self.capture.post(self.viewer._stop_recording)
             if self._session_dir:
-                self._finish_session(self._session_dir, had_video)
+                self._finish_session(self._session_dir, combined, sound)
             self.btn_record.config(text="●  Start Recording", bg=REC_RED,
                                    activebackground="#d63c3c")
             self.var_name.set(self._default_name())
@@ -679,14 +728,69 @@ class P3GUI:
         base = os.path.join(session, "thermal")
 
         self._record_intent = True
-        if self.uvc_cam is not None and self.var_uvc_on.get():
-            self.uvc_cam.start_recording(os.path.join(session, "visible.mp4"))
         self._start_audio(session)
+        if self.uvc_cam is not None and self.var_uvc_on.get():
+            self._open_combined(session)
 
         # Let the capture thread open the files; it owns the writer.
         self.viewer._pending_record = base
         self.btn_record.config(text="■  Stop Recording", bg="#5c6370",
                                activebackground="#6b7280")
+
+    def _combined_frame(self, thermal, when) -> None:
+        """Write one frame of the combined video. Runs on the capture thread.
+
+        Driven by the thermal frames rather than a timer of its own, so the two
+        feeds share a single clock and the file has one consistent rate to
+        align the sound against.
+        """
+        if self._combined is None:
+            return
+        visible = self.uvc_cam.latest() if self.uvc_cam is not None else None
+        frame = self._stacked(thermal, visible) if visible is not None else thermal
+        w, h = self._combined_size or (0, 0)
+        if (frame.shape[1], frame.shape[0]) != (w, h):
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        self._combined.write(frame)
+        self._combined_frames += 1
+        self._combined_end = when or time.time()
+
+    def _open_combined(self, session: str) -> None:
+        """Size and open the combined writer from the frames available now."""
+        thermal = self.capture.latest()
+        if thermal is None:
+            return
+        visible = self.uvc_cam.latest() if self.uvc_cam is not None else None
+        sample = self._stacked(thermal, visible) if visible is not None else thermal
+        h, w = sample.shape[:2]
+        writer = cv2.VideoWriter(
+            os.path.join(session, "combined.mp4"),
+            cv2.VideoWriter_fourcc(*"mp4v"), self.viewer.record_fps, (w, h),
+        )
+        if not writer.isOpened():
+            return
+        self._combined = writer
+        self._combined_size = (w, h)
+        self._combined_frames = 0
+        self._combined_start = time.time()
+        self._combined_end = self._combined_start
+        self.viewer.frame_hook = self._combined_frame
+
+    def _close_combined(self) -> dict[str, object]:
+        self.viewer.frame_hook = None
+        writer, self._combined = self._combined, None
+        if writer is None:
+            return {}
+        writer.release()
+        span = max(self._combined_end - self._combined_start, 1e-6)
+        return {
+            "file": "combined.mp4",
+            "frames": self._combined_frames,
+            "declared_fps": self.viewer.record_fps,
+            "measured_fps": round(self._combined_frames / span, 3),
+            "started_at_epoch": round(self._combined_start, 3),
+            "duration_s": round(span, 3),
+        }
 
     def _start_audio(self, session: str) -> None:
         """Begin capturing sound for this session, if enabled."""
@@ -711,27 +815,47 @@ class P3GUI:
             return {"error": rec.error}
         if meta:
             meta["file"] = os.path.basename(str(meta["file"]))
+            meta["started_at_epoch"] = round(rec.started_at, 3)
         return meta
 
-    def _finish_session(self, session: str, had_video: bool) -> None:
-        """Mux the sound into the visible mp4 once both have been written.
+    def _finish_session(
+        self, session: str, video_meta: dict, audio_meta: dict
+    ) -> None:
+        """Mux the sound into the combined mp4, correcting drift and offset.
 
         Runs off the Tk thread: ffmpeg copies the video stream but still has to
         encode the audio, which should not freeze the window.
         """
-        video = os.path.join(session, "visible.mp4")
+        video = os.path.join(session, "combined.mp4")
         sound = os.path.join(session, "audio.wav")
-        if not (had_video and os.path.exists(video) and os.path.exists(sound)):
+        if not (video_meta and os.path.exists(video) and os.path.exists(sound)):
             return
 
+        # The writer was told a frame rate before the first frame existed, so
+        # the container's rate is a guess. Rescale to what was really captured,
+        # otherwise the picture drifts against the sound over the recording.
+        declared = float(video_meta.get("declared_fps") or 0.0)
+        measured = float(video_meta.get("measured_fps") or 0.0)
+        timescale = declared / measured if declared > 0 and measured > 0 else 1.0
+
+        # Sound starts on the button press; the video writer cannot open until
+        # a frame has arrived to size it, so trim that lead off the audio.
+        skip = 0.0
+        a_start = audio_meta.get("started_at_epoch")
+        v_start = video_meta.get("started_at_epoch")
+        if isinstance(a_start, (int, float)) and isinstance(v_start, (int, float)):
+            skip = max(0.0, float(v_start) - float(a_start))
+
         def work() -> None:
-            merged = os.path.join(session, "visible_av.mp4")
-            error = audio.mux(video, sound, merged)
+            merged = os.path.join(session, "combined_av.mp4")
+            error = audio.mux(video, sound, merged,
+                              timescale=timescale, audio_skip=skip)
             if error is None and os.path.exists(merged):
                 try:
                     os.replace(merged, video)
                     os.remove(sound)
-                    note = "sound muxed into visible.mp4"
+                    note = (f"combined.mp4 with sound "
+                            f"({measured:.1f} fps, {skip * 1000:.0f} ms offset)")
                 except OSError as e:
                     note = f"mux kept separate: {e}"
             else:
@@ -978,11 +1102,11 @@ class P3GUI:
             # simply has not opened yet.
             if self._record_intent and self.viewer._pending_record is None:
                 self._record_intent = False
-                had_video = self.uvc_cam is not None and self.uvc_cam.recording
+                combined = self._close_combined()
                 self._stop_uvc_recording()
-                self._stop_audio()
+                sound = self._stop_audio()
                 if self._session_dir:
-                    self._finish_session(self._session_dir, had_video)
+                    self._finish_session(self._session_dir, combined, sound)
 
         self._update_uvc_status()
 
@@ -1000,6 +1124,9 @@ class P3GUI:
             size = f"{frame.shape[1]}x{frame.shape[0]}" if frame is not None else "-"
             self.lbl_uvc.config(text=f"Ready  {size} @ {cam.fps:g} fps",
                                 foreground=OK_GREEN)
+        # Report the position the lens actually took, not the requested one.
+        if cam.focus is not None and cam.focus >= 0:
+            self.lbl_focus.config(text=f"{cam.focus:.0f}")
 
     def _on_close(self) -> None:
         if self._recording and not messagebox.askyesno(
@@ -1007,6 +1134,7 @@ class P3GUI:
         ):
             return
         self._closing = True
+        self._close_combined()
         self._stop_uvc_recording()
         self._stop_audio()
         self._close_uvc()

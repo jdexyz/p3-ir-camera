@@ -153,8 +153,26 @@ class AudioRecorder(threading.Thread):
             self.error = str(e)
 
 
-def mux(video: str, audio: str, output: str, timeout: float = 120.0) -> str | None:
-    """Combine a video file and a WAV into one mp4.
+def mux(
+    video: str,
+    audio: str,
+    output: str,
+    timeout: float = 120.0,
+    timescale: float = 1.0,
+    audio_skip: float = 0.0,
+) -> str | None:
+    """Combine a video file and a WAV into one mp4, correcting drift.
+
+    Two corrections keep sound aligned with picture:
+
+    * `timescale` rescales the video's timestamps. A VideoWriter has to be told
+      a frame rate before the first frame exists, so the container's declared
+      rate is a guess; the real rate is only known once capture ends. Left
+      uncorrected the picture runs fast or slow against the sound, and the
+      error accumulates over the whole recording.
+    * `audio_skip` trims the head of the WAV. Audio capture starts as soon as
+      recording is pressed, but the video writer cannot open until a frame has
+      arrived to size it, so the sound leads the picture by that gap.
 
     The video stream is copied rather than re-encoded, so this costs little and
     cannot degrade the recording.
@@ -165,9 +183,13 @@ def mux(video: str, audio: str, output: str, timeout: float = 120.0) -> str | No
     exe = ffmpeg_exe()
     if exe is None:
         return "no ffmpeg available"
-    cmd = [
-        exe, "-y", "-loglevel", "error",
-        "-i", video,
+    cmd = [exe, "-y", "-loglevel", "error"]
+    if abs(timescale - 1.0) > 1e-6:
+        cmd += ["-itsscale", f"{timescale:.6f}"]
+    cmd += ["-i", video]
+    if audio_skip > 0.001:
+        cmd += ["-ss", f"{audio_skip:.3f}"]
+    cmd += [
         "-i", audio,
         "-c:v", "copy",
         "-c:a", "aac",

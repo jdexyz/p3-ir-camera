@@ -142,12 +142,32 @@ are independent devices with their own clocks, so their frames do not correspond
 one-for-one; align them with `started_at` and `measured_fps` rather than by frame
 index.
 
+#### Focus
+
+The **Autofocus** checkbox and **Focus** slider drive a webcam with a motorised lens;
+the slider is greyed out while autofocus is on, and the value shown is the position
+the lens reported back rather than the one requested, since the device quantises and
+clamps what it is given.
+
+This needs the DirectShow backend on Windows. Media Foundation, OpenCV's default
+there, accepts focus writes, returns success and silently ignores them. If DirectShow
+cannot open a device the code falls back to the default backend, so capture still
+works -- without focus control. A camera with a fixed lens reports `-1` and the
+controls do nothing.
+
 #### Sound
 
-**Record sound** captures a microphone alongside the visible camera and muxes it into
-`visible.mp4`, so that file plays with audio. The microphone list defaults to one
+**Record sound** captures a microphone alongside the video and muxes it into
+`combined.mp4`, so that file plays with audio. The microphone list defaults to one
 whose name looks like a camera's own (e.g. `Microphone (UGREEN Camera 2K)`) rather
 than the machine's built-in array.
+
+Two corrections keep it aligned. A `VideoWriter` must be told a frame rate before the
+first frame exists, so the container's declared rate is a guess; the real rate is only
+known once capture ends, and the timestamps are rescaled to it at mux time. Audio also
+starts on the button press while the video writer cannot open until a frame has sized
+it, so that lead is trimmed off the sound. A measured session showed a 5 ms lead and
+0.1% rate error, both corrected.
 
 OpenCV cannot record audio, so this needs `sounddevice` for capture and ffmpeg for
 muxing; `imageio-ffmpeg` supplies a bundled ffmpeg binary, and a system ffmpeg is used
@@ -228,12 +248,16 @@ only make sense together stay together:
 
 ```
 run01/
-  thermal.mp4     Rendered feed -- colormap, overlays, colorbar
+  combined.mp4    Both feeds stacked in one file, with sound
+  thermal.mp4     Thermal feed alone -- colormap, overlays, colorbar
   thermal.raw     16-bit little-endian frames, pre-TNR sensor counts
   thermal.json    Frame counts, start times, measured rates, gain/AGC, emissivity
-  visible.mp4     Visible-light camera, with sound muxed in
   audio.wav       Only if muxing was unavailable
 ```
+
+`combined.mp4` is written frame-for-frame from the thermal capture loop, taking
+whatever the webcam last delivered. Both feeds therefore share one clock and the
+file has a single consistent rate for the sound to align against.
 
 `p3-viewer --record BASE` writes the same thermal trio without a folder, as
 `BASE.mp4` / `BASE.raw` / `BASE.json`, and `R` toggles recording at runtime.
