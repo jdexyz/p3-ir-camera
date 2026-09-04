@@ -35,6 +35,7 @@ import usb.util
 from p3_camera import GainMode
 from p3_viewer import AGCMode, ColormapID, HotspotMode, P3Viewer
 
+import audio
 import uvc
 
 
@@ -209,6 +210,10 @@ class P3GUI:
         # be mistaken for "recording finished".
         self._record_intent = False
         self._view_missing_note = ""
+        self.audio_rec: audio.AudioRecorder | None = None
+        self._session_dir: str | None = None
+        self._mux_thread: threading.Thread | None = None
+        self._closing = False
         self.uvc_devices: list[tuple[int, int, int]] = []
         self._uvc_preferred = uvc_index
 
@@ -393,7 +398,7 @@ class P3GUI:
         box = ttk.Labelframe(parent, text=" Visible camera ", padding=10)
         box.pack(fill="x", padx=10, pady=6)
 
-        self.var_uvc_on = tk.BooleanVar(value=False)
+        self.var_uvc_on = tk.BooleanVar(value=True)
         ttk.Checkbutton(box, text="Record visible alongside thermal",
                         variable=self.var_uvc_on,
                         command=self._toggle_uvc).pack(anchor="w")
@@ -408,9 +413,39 @@ class P3GUI:
                                  style="Dim.TLabel")
         self.lbl_uvc.pack(anchor="w", pady=(8, 0))
 
+        self.var_audio_on = tk.BooleanVar(value=audio.available())
+        ttk.Checkbutton(box, text="Record sound", variable=self.var_audio_on,
+                        command=self._sync_audio_enabled).pack(anchor="w",
+                                                               pady=(10, 0))
+        self.audio_inputs = audio.list_inputs()
+        self.var_mic = tk.StringVar()
+        self.cb_mic = ttk.Combobox(box, textvariable=self.var_mic,
+                                   state="readonly",
+                                   values=[n for _, n, _, _ in self.audio_inputs])
+        self.cb_mic.pack(fill="x", pady=(4, 0))
+        preferred = audio.preferred_input(self.audio_inputs)
+        if preferred is not None:
+            self.var_mic.set(preferred[1])
+        else:
+            self.var_mic.set("sounddevice not installed"
+                             if not audio.available() else "no microphone found")
+        self._sync_audio_enabled()
+
         # Probing opens each device in turn and costs a second or two, so it
         # must not block the window from appearing.
         threading.Thread(target=self._probe_uvc, daemon=True).start()
+
+    def _sync_audio_enabled(self) -> None:
+        usable = audio.available() and bool(self.audio_inputs)
+        if not usable:
+            self.var_audio_on.set(False)
+        self.cb_mic.config(
+            state="readonly" if usable and self.var_audio_on.get() else "disabled"
+        )
+
+    def _selected_mic(self) -> tuple[int, str, int, float] | None:
+        name = self.var_mic.get()
+        return next((d for d in self.audio_inputs if d[1] == name), None)
 
     def _probe_uvc(self) -> None:
         devices = uvc.list_cameras()
@@ -601,11 +636,17 @@ class P3GUI:
 
     def _toggle_record(self) -> None:
         if self._recording:
-            # Finalize the visible stream first so its metadata makes it into
-            # the thermal sidecar, which is written by _stop_recording.
+            # Finalize the companion streams first so their metadata makes it
+            # into the sidecar, which _stop_recording writes.
             self._record_intent = False
+            had_video = self.uvc_cam is not None and self.uvc_cam.recording
             self._stop_uvc_recording()
+            sound = self._stop_audio()
+            if sound:
+                self.viewer.extra_metadata.setdefault("audio", sound)
             self.capture.post(self.viewer._stop_recording)
+            if self._session_dir:
+                self._finish_session(self._session_dir, had_video)
             self.btn_record.config(text="●  Start Recording", bg=REC_RED,
                                    activebackground="#d63c3c")
             self.var_name.set(self._default_name())
@@ -620,21 +661,96 @@ class P3GUI:
             messagebox.showerror("Recording", f"Folder does not exist:\n{folder}")
             return
 
-        base = os.path.join(folder, name)
-        exists = any(os.path.exists(base + ext) for ext in (".mp4", ".raw", ".json"))
-        if exists and not messagebox.askyesno(
-            "Overwrite?", f"{name} already exists. Overwrite?"
+        # One folder per session: a capture is several files that only make
+        # sense together, and they were easy to lose among earlier recordings.
+        session = os.path.join(folder, name)
+        occupied = os.path.isdir(session) and os.listdir(session)
+        if occupied and not messagebox.askyesno(
+            "Overwrite?", f"{name} already exists and is not empty. Overwrite?"
         ):
             return
+        try:
+            os.makedirs(session, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Recording", f"Could not create folder:\n{e}")
+            return
+
+        self._session_dir = session
+        base = os.path.join(session, "thermal")
 
         self._record_intent = True
         if self.uvc_cam is not None and self.var_uvc_on.get():
-            self.uvc_cam.start_recording(f"{base}_vis.mp4")
+            self.uvc_cam.start_recording(os.path.join(session, "visible.mp4"))
+        self._start_audio(session)
 
         # Let the capture thread open the files; it owns the writer.
         self.viewer._pending_record = base
         self.btn_record.config(text="■  Stop Recording", bg="#5c6370",
                                activebackground="#6b7280")
+
+    def _start_audio(self, session: str) -> None:
+        """Begin capturing sound for this session, if enabled."""
+        if not self.var_audio_on.get():
+            return
+        mic = self._selected_mic()
+        if mic is None:
+            return
+        index, _name, channels, samplerate = mic
+        self.audio_rec = audio.AudioRecorder(
+            os.path.join(session, "audio.wav"),
+            device=index, channels=channels, samplerate=samplerate,
+        )
+        self.audio_rec.start()
+
+    def _stop_audio(self) -> dict[str, object]:
+        rec, self.audio_rec = self.audio_rec, None
+        if rec is None:
+            return {}
+        meta = rec.stop()
+        if rec.error:
+            return {"error": rec.error}
+        if meta:
+            meta["file"] = os.path.basename(str(meta["file"]))
+        return meta
+
+    def _finish_session(self, session: str, had_video: bool) -> None:
+        """Mux the sound into the visible mp4 once both have been written.
+
+        Runs off the Tk thread: ffmpeg copies the video stream but still has to
+        encode the audio, which should not freeze the window.
+        """
+        video = os.path.join(session, "visible.mp4")
+        sound = os.path.join(session, "audio.wav")
+        if not (had_video and os.path.exists(video) and os.path.exists(sound)):
+            return
+
+        def work() -> None:
+            merged = os.path.join(session, "visible_av.mp4")
+            error = audio.mux(video, sound, merged)
+            if error is None and os.path.exists(merged):
+                try:
+                    os.replace(merged, video)
+                    os.remove(sound)
+                    note = "sound muxed into visible.mp4"
+                except OSError as e:
+                    note = f"mux kept separate: {e}"
+            else:
+                # Keeping the WAV is the safe outcome: nothing is lost, the
+                # two files just have to be combined by hand.
+                note = f"sound kept as audio.wav ({error})"
+            if self._closing:
+                return
+            try:
+                self.root.after(
+                    0, lambda: self.lbl_uvc.config(text=note, foreground=FG_DIM)
+                )
+            except tk.TclError:
+                # The window went away while ffmpeg was running; the files are
+                # already on disk, so there is nothing left to report.
+                pass
+
+        self._mux_thread = threading.Thread(target=work, daemon=True)
+        self._mux_thread.start()
 
     def _stop_uvc_recording(self) -> None:
         """Finalize the visible recording and stage it for the sidecar."""
@@ -642,8 +758,7 @@ class P3GUI:
             return
         meta = self.uvc_cam.stop_recording()
         if meta:
-            base = self.viewer._record_base or ""
-            meta["file"] = f"{os.path.basename(base)}_vis.mp4"
+            meta["file"] = "visible.mp4"
             meta["note"] = (
                 "Independent device; align with the thermal stream using "
                 "started_at and measured_fps rather than frame index."
@@ -863,7 +978,11 @@ class P3GUI:
             # simply has not opened yet.
             if self._record_intent and self.viewer._pending_record is None:
                 self._record_intent = False
+                had_video = self.uvc_cam is not None and self.uvc_cam.recording
                 self._stop_uvc_recording()
+                self._stop_audio()
+                if self._session_dir:
+                    self._finish_session(self._session_dir, had_video)
 
         self._update_uvc_status()
 
@@ -887,8 +1006,14 @@ class P3GUI:
             "Quit", "A recording is in progress. Stop it and quit?"
         ):
             return
+        self._closing = True
         self._stop_uvc_recording()
+        self._stop_audio()
         self._close_uvc()
+        # Let a mux that is already running finish writing before the process
+        # goes away, so the session is not left with a stray WAV.
+        if self._mux_thread is not None and self._mux_thread.is_alive():
+            self._mux_thread.join(timeout=30.0)
         self.capture.stop()
         self.capture.join(timeout=5.0)
         self.root.destroy()

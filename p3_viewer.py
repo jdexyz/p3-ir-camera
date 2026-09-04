@@ -386,7 +386,7 @@ class P3Viewer:
                  baud_rate: int = 115200, lockin_period: float = 1.0,
                  lockin_integration: float = 60.0, lockin_invert: bool = False,
                  fixed_range: tuple[float, float] | None = None,
-                 log_scale: bool = False, log_strength: float = 50.0,
+                 log_scale: bool = True, log_strength: float = 50.0,
                  show_timestamp: bool = True,
                  gain_mode: GainMode | None = None,
                  record: str | None = None, record_fps: float = 25.0) -> None:
@@ -401,7 +401,7 @@ class P3Viewer:
             fixed_range: (min_c, max_c) bounds for the absolute AGC modes.
                 Selects FIXED_RANGE (or LOG_RANGE) at startup when given.
             show_timestamp: Burn a date/time stamp into the rendered image.
-            log_scale: Use the logarithmic mapping for fixed_range.
+            log_scale: Use the logarithmic mapping for fixed_range (default).
             log_strength: Log curve strength; higher lifts the cool end more.
             gain_mode: Sensor gain mode to apply at startup. LOW is required
                 for scenes above 150 C.
@@ -1313,8 +1313,13 @@ def main() -> None:
     parser.add_argument(
         "--log",
         action="store_true",
-        help="Map --range logarithmically so near-ambient detail stays visible "
-             "alongside a hot target. Still an absolute, time-invariant scale.",
+        help="Map --range logarithmically (this is the default; kept for "
+             "explicitness). Still an absolute, time-invariant scale.",
+    )
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Map --range linearly instead of logarithmically",
     )
     parser.add_argument(
         "--log-strength",
@@ -1351,8 +1356,8 @@ def main() -> None:
 
     if args.range is not None and args.range[0] >= args.range[1]:
         parser.error("--range MIN_C must be less than MAX_C")
-    if args.log and args.range is None:
-        parser.error("--log requires --range")
+    if args.log and args.linear:
+        parser.error("--log and --linear are mutually exclusive")
     if args.log_strength <= 0:
         parser.error("--log-strength must be positive")
 
@@ -1366,7 +1371,7 @@ def main() -> None:
            P3Viewer(model=args.model, serial_port=args.serial_port, baud_rate=args.baud_rate,
                lockin_period=args.period, lockin_integration=args.integration,
                lockin_invert=args.invert, fixed_range=fixed_range,
-               log_scale=args.log, log_strength=args.log_strength,
+               log_scale=not args.linear, log_strength=args.log_strength,
                show_timestamp=not args.no_timestamp,
                gain_mode=gain_mode, record=args.record,
                record_fps=args.record_fps).run()

@@ -136,11 +136,24 @@ highest-resolution device is selected by default, which picks a dedicated captur
 camera over a built-in webcam (the built-in one always takes index 0). `--uvc INDEX`
 preselects a specific one.
 
-The visible stream is written to `BASE_vis.mp4` at the webcam's own frame rate, and
-its frame count, resolution and start time are added to the thermal sidecar under
-`visible`. The two cameras are independent devices with their own clocks, so their
-frames do not correspond one-for-one; align them with `started_at` and
-`measured_fps` rather than by frame index.
+The visible stream is written at the webcam's own frame rate, and its frame count,
+resolution and start time are added to the sidecar under `visible`. The two cameras
+are independent devices with their own clocks, so their frames do not correspond
+one-for-one; align them with `started_at` and `measured_fps` rather than by frame
+index.
+
+#### Sound
+
+**Record sound** captures a microphone alongside the visible camera and muxes it into
+`visible.mp4`, so that file plays with audio. The microphone list defaults to one
+whose name looks like a camera's own (e.g. `Microphone (UGREEN Camera 2K)`) rather
+than the machine's built-in array.
+
+OpenCV cannot record audio, so this needs `sounddevice` for capture and ffmpeg for
+muxing; `imageio-ffmpeg` supplies a bundled ffmpeg binary, and a system ffmpeg is used
+if present. If either is missing the capture still runs -- the sound is simply left as
+`audio.wav` beside the video, and the sidecar says so. Muxing uses `-shortest`, so the
+combined file is as long as the shorter of the two streams.
 
 ### Viewer
 
@@ -192,6 +205,9 @@ Display value for a 20-350 C scale:
 | 150 C | 100/255 | 196/255 | 208/255 |
 | 350 C | 254/255 | 254/255 | 254/255 |
 
+The logarithmic mapping is the **default** for `--range`; pass `--linear` for the
+plain linear mapping.
+
 `--log-strength` (default 50) sets the curve: lower approaches linear, higher lifts the
 cool end further. It applies only in log mode -- in the GUI the slider is greyed out
 in the linear modes, since a live-looking control that changes nothing reads as a
@@ -207,14 +223,20 @@ unchanged sensor data either way.
 
 ### Recording
 
-`--record BASE` writes three files simultaneously, and `R` toggles recording at runtime:
+The GUI writes one folder per session, named after the recording, so the files that
+only make sense together stay together:
 
-| File | Contents |
-| --- | --- |
-| `BASE.mp4` | Rendered feed -- colormap, overlays, colorbar |
-| `BASE.raw` | 16-bit little-endian thermal frames, **pre-TNR** sensor counts |
-| `BASE.json` | Frame count, start time, measured fps, array shape, gain/AGC settings, emissivity |
-| `BASE_vis.mp4` | Visible-light camera, when enabled in the GUI |
+```
+run01/
+  thermal.mp4     Rendered feed -- colormap, overlays, colorbar
+  thermal.raw     16-bit little-endian frames, pre-TNR sensor counts
+  thermal.json    Frame counts, start times, measured rates, gain/AGC, emissivity
+  visible.mp4     Visible-light camera, with sound muxed in
+  audio.wav       Only if muxing was unavailable
+```
+
+`p3-viewer --record BASE` writes the same thermal trio without a folder, as
+`BASE.mp4` / `BASE.raw` / `BASE.json`, and `R` toggles recording at runtime.
 
 ```bash
 p3-viewer --range 20 350 --gain low --record run01
@@ -226,9 +248,9 @@ Read it back with the shape from the sidecar:
 
 ```python
 import json, numpy as np
-meta = json.load(open("run01.json"))
+meta = json.load(open("run01/thermal.json"))
 n, rows, cols = meta["raw_shape"]
-raw = np.memmap("run01.raw", dtype="<u2", mode="r").reshape(n, rows, cols)
+raw = np.memmap("run01/thermal.raw", dtype="<u2", mode="r").reshape(n, rows, cols)
 celsius = raw / 64.0 - 273.15
 ```
 

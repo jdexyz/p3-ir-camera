@@ -26,6 +26,12 @@ MAX_PROBE_INDEX = 4
 # Used when the device does not report a usable rate.
 DEFAULT_FPS = 30.0
 
+# A camera can open successfully and then never deliver a frame -- Media
+# Foundation reports MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED when another
+# application holds the device. Waiting silently forever hides that, so give up
+# and report it.
+NO_FRAME_TIMEOUT = 5.0
+
 
 # Asking for more than any webcam provides makes each one settle on its own
 # maximum, which is the only thing distinguishing them through OpenCV.
@@ -185,14 +191,21 @@ class UVCCamera(threading.Thread):
             self._cap = cap
             self.opened.set()
 
+            last_ok = time.time()
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     # A momentary read failure is normal on some webcams; a
-                    # persistent one is handled by the caller noticing the
-                    # frame stops updating.
+                    # sustained one means the device is not really ours.
+                    if time.time() - last_ok > NO_FRAME_TIMEOUT:
+                        self.error = (
+                            f"Camera {self.index} opened but delivered no frames "
+                            "- another application may be using it"
+                        )
+                        return
                     time.sleep(0.02)
                     continue
+                last_ok = time.time()
                 captured = time.time()
                 with self._lock:
                     self._frame = frame
