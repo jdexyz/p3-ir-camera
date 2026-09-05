@@ -193,11 +193,22 @@ class ReplayWindow:
 
         self.index = 0
         self.playing = False
+        # Never schedule back to back, so Tk always gets a slice in which to
+        # repaint the widget.
+        self.MIN_IDLE_MS = 5
         self._play_started = 0.0
         self._play_from_index = 0
         self._photo: ImageTk.PhotoImage | None = None
         self._probe: tuple[int, int] | None = None
         self._thermal_box = (0, 0, 0, 0)  # where the thermal pane is on screen
+        # Decoding position, so playback reads the video forward instead of
+        # seeking to every frame.
+        self._video_pos = 0
+        self._visible_index = -1
+        self._last_visible: NDArray[np.uint8] | None = None
+        # Set while the code moves the slider, so its callback does not treat
+        # that as the user scrubbing.
+        self._syncing = False
 
         root.title(f"Replay - {os.path.basename(session.folder)}")
         root.geometry("1100x900")
@@ -250,13 +261,26 @@ class ReplayWindow:
         return apply_colormap(img, ColormapID.IRONBOW)
 
     def _visible_pane(self) -> NDArray[np.uint8] | None:
+        """The webcam pane for the current frame.
+
+        Seeking an H.264 file costs about 39 ms a frame because the decoder has
+        to return to a keyframe, against a frame budget of roughly 50 ms. Read
+        forward instead and seek only when the position actually jumps, which
+        is twelve times cheaper and leaves the interface responsive.
+        """
         if self.cap is None:
             return None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.index)
+        if self._visible_index == self.index:
+            return self._last_visible
+        if self.index != self._video_pos:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.index)
+            self._video_pos = self.index
         ok, frame = self.cap.read()
-        if not ok or frame is None:
-            return None
-        return frame[self.session.split:]
+        if ok and frame is not None:
+            self._video_pos += 1
+            self._visible_index = self.index
+            self._last_visible = frame[self.session.split:]
+        return self._last_visible
 
     def _show(self) -> None:
         thermal = self._render_thermal()
@@ -300,8 +324,16 @@ class ReplayWindow:
                 self._display_scale = f
         self._thermal_scale = scale
         rgb = cv2.cvtColor(composed, cv2.COLOR_BGR2RGB)
-        self._photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.view.config(image=self._photo)
+        image = Image.fromarray(rgb)
+        # Pasting into the existing PhotoImage is far cheaper than building a
+        # new one every frame, which dominated the per-frame cost.
+        if self._photo is not None and (
+            self._photo.width(), self._photo.height()
+        ) == image.size:
+            self._photo.paste(image)
+        else:
+            self._photo = ImageTk.PhotoImage(image)
+            self.view.config(image=self._photo)
 
         t = self.index / self.session.fps
         self.lbl_time.config(text=f"{t:5.1f}s / {self.session.duration:.1f}s")
@@ -331,6 +363,10 @@ class ReplayWindow:
         self._show()
 
     def _seek(self, _value: str | None = None) -> None:
+        # Moving the slider from _tick must not be mistaken for a scrub: doing
+        # so restarted the clock every tick, so the frame never advanced.
+        if self._syncing:
+            return
         index = int(float(self.var_pos.get()))
         if index == self.index:
             return
@@ -373,10 +409,32 @@ class ReplayWindow:
                 self.player.stop()
         elif index != self.index:
             self.index = index
-        self.var_pos.set(self.index)
+        else:
+            # Same frame as last tick; nothing to redraw.
+            self.root.after(self._next_delay(), self._tick)
+            return
+        self._syncing = True
+        try:
+            self.var_pos.set(self.index)
+        finally:
+            self._syncing = False
         self._show()
         if self.playing:
-            self.root.after(15, self._tick)
+            self.root.after(self._next_delay(), self._tick)
+
+    def _next_delay(self) -> int:
+        """Milliseconds until the next frame is due.
+
+        Scheduling a fixed interval queues callbacks back to back whenever a
+        render overruns it, and a Tk loop that never goes idle never repaints:
+        the picture sits still until playback stops. Aiming at the next frame's
+        due time instead leaves the loop idle between frames, and a render that
+        overruns simply drops frames rather than starving the interface.
+        """
+        due = self._play_started + (
+            self.index + 1 - self._play_from_index
+        ) / self.session.fps
+        return max(self.MIN_IDLE_MS, int((due - time.time()) * 1000))
 
     def _close(self) -> None:
         self.playing = False
