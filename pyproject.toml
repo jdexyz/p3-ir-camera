@@ -56,7 +56,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 include = ["p3_camera.py", "p3_viewer.py", "p3_gui.py", "lockin.py",
-           "uvc.py", "audio.py", "overlay.py", "replay.py"]
+           "uvc.py", "audio.py", "overlay.py", "replay.py",
+           "thermal_store.py", "temp_feed.py"]
 
 [tool.ruff]
 fix = true

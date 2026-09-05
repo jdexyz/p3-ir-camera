@@ -48,6 +48,7 @@ from p3_camera import (
     raw_to_celsius_corrected,
 )
 
+import temp_feed
 import thermal_store
 
 
@@ -450,6 +451,14 @@ class P3Viewer:
         self._pending_record: str | None = record
         self._last_thermal: NDArray[np.uint16] | None = None
         self._frame_time: float | None = None
+        # Maximum temperature over the region of interest, with the time it was
+        # measured. Consumed by the Sonia temperature feed, which treats the
+        # absence of a reading as a sensor fault, so this is cleared rather
+        # than held whenever it stops being trustworthy.
+        self._max_temp_c: float | None = None
+        self._max_temp_time: float | None = None
+        # (x, y, w, h) in sensor pixels; None means the whole frame.
+        self.temp_roi: tuple[int, int, int, int] | None = None
         self._last_stats: dict[str, Any] = {}
         # Merged into the recording sidecar; lets a caller record a companion
         # stream (e.g. a visible-light camera) alongside the thermal data.
@@ -495,6 +504,7 @@ class P3Viewer:
 
     def close_camera(self) -> None:
         """Finalize any recording and stop the stream."""
+        self.invalidate_max_temp()
         self._stop_recording()
         self.camera.stop_streaming()
 
@@ -509,6 +519,7 @@ class P3Viewer:
         if thermal is None:
             return None
         self._frame_time = time.time()
+        self._update_max_temp(thermal)
         self._ir_brightness = ir_brightness
 
         # Feed frames to lock-in controller so only one thread reads USB.
@@ -540,6 +551,55 @@ class P3Viewer:
                 print(f"Frame hook failed: {e}")
         self._update_fps()
         return self._last_display
+
+    def _update_max_temp(self, thermal: NDArray[np.uint16]) -> None:
+        """Record the hottest point of the region of interest.
+
+        Measured from the pre-TNR frame: temporal noise reduction blends
+        frames, and a control loop should act on what the sensor just saw.
+        """
+        region = thermal
+        if self.temp_roi is not None:
+            x, y, w, h = self.temp_roi
+            region = thermal[y:y + h, x:x + w]
+        if region.size == 0:
+            # The region of interest is off the frame, so there is no reading.
+            self.invalidate_max_temp()
+            return
+        self._max_temp_c = float(
+            raw_to_celsius_corrected(region.max(), self.camera.env_params)
+        )
+        self._max_temp_time = self._frame_time
+
+    def trigger_shutter(self) -> None:
+        """Run a shutter/NUC cycle, with no reading published across it.
+
+        The frames around a calibration cycle are mistimed and partly stale,
+        so the feed must go quiet rather than report them.
+        """
+        self.invalidate_max_temp()
+        self.camera.trigger_shutter()
+        self.invalidate_max_temp()
+
+    def invalidate_max_temp(self) -> None:
+        """Drop the current reading, so the feed goes quiet until a real one."""
+        self._max_temp_c = None
+        self._max_temp_time = None
+
+    def latest_max_temp_c(self, max_age: float = 0.5) -> float | None:
+        """The hottest point of the region of interest, or None if not fresh.
+
+        None is the fault signal for the Sonia feed: returning a stale value
+        would look like a healthy measurement and defeat the consumer's
+        timeout, which is what cuts the ultrasound. The age limit is well
+        inside that timeout so a stall is caught long before it matters.
+        """
+        when = self._max_temp_time
+        if when is None or self._max_temp_c is None:
+            return None
+        if time.time() - when > max_age:
+            return None
+        return self._max_temp_c
 
     def run(self) -> None:
         """Main viewer loop."""
@@ -1012,7 +1072,7 @@ class P3Viewer:
         elif key == ord("c"):
             self.colormap_idx = (self.colormap_idx + 1) % len(ColormapID)
         elif key == ord("s"):
-            self.camera.trigger_shutter()
+            self.trigger_shutter()
             print("Shutter triggered")
         elif key == ord("g"):
             # Cycle gain mode: HIGH -> LOW -> HIGH
@@ -1359,6 +1419,29 @@ def main() -> None:
         help="Log curve strength; higher lifts the cool end more (default: 50)",
     )
     parser.add_argument(
+        "--temp-feed",
+        action="store_true",
+        help="Serve the max temperature to the Sonia press over TCP as "
+             "newline-delimited JSON",
+    )
+    parser.add_argument(
+        "--temp-host", default=temp_feed.DEFAULT_HOST,
+        help=f"Feed bind address (default: {temp_feed.DEFAULT_HOST})",
+    )
+    parser.add_argument(
+        "--temp-port", type=int, default=temp_feed.DEFAULT_PORT,
+        help=f"Feed port (default: {temp_feed.DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--temp-hz", type=float, default=temp_feed.DEFAULT_HZ,
+        help=f"Feed rate (default: {temp_feed.DEFAULT_HZ:g})",
+    )
+    parser.add_argument(
+        "--temp-roi", nargs=4, type=int, default=None,
+        metavar=("X", "Y", "W", "H"),
+        help="Region of interest in sensor pixels for the fed maximum",
+    )
+    parser.add_argument(
         "--no-compress",
         action="store_true",
         help="Store the thermal stream as a plain .raw file instead of the "
@@ -1405,14 +1488,26 @@ def main() -> None:
                GainMode[args.gain.upper()] if args.gain is not None else None
            )
            fixed_range = tuple(args.range) if args.range is not None else None
-           P3Viewer(model=args.model, serial_port=args.serial_port, baud_rate=args.baud_rate,
+           viewer = P3Viewer(
+               model=args.model, serial_port=args.serial_port, baud_rate=args.baud_rate,
                lockin_period=args.period, lockin_integration=args.integration,
                lockin_invert=args.invert, fixed_range=fixed_range,
                log_scale=not args.linear, log_strength=args.log_strength,
                show_timestamp=not args.no_timestamp,
                compress_raw=not args.no_compress,
                gain_mode=gain_mode, record=args.record,
-               record_fps=args.record_fps).run()
+               record_fps=args.record_fps)
+           if args.temp_roi:
+               viewer.temp_roi = tuple(args.temp_roi)
+           if args.temp_feed:
+               feed = temp_feed.TempFeedServer(
+                   viewer.latest_max_temp_c, host=args.temp_host,
+                   port=args.temp_port, hz=args.temp_hz,
+               )
+               feed.start()
+               feed.started.wait(2.0)
+               print(feed.status())
+           viewer.run()
     except RuntimeError as e:
         print(f"Error: {e}")
     except KeyboardInterrupt:

@@ -36,6 +36,7 @@ from p3_camera import GainMode
 from p3_viewer import AGCMode, ColormapID, HotspotMode, P3Viewer
 
 import audio
+import temp_feed
 import uvc
 
 
@@ -199,9 +200,11 @@ class P3GUI:
     """Tk control panel."""
 
     def __init__(self, root: tk.Tk, viewer: P3Viewer,
-                 uvc_index: int | None = None) -> None:
+                 uvc_index: int | None = None,
+                 feed: temp_feed.TempFeedServer | None = None) -> None:
         self.root = root
         self.viewer = viewer
+        self.feed = feed
         self.capture = CaptureThread(viewer)
         self._photo: ImageTk.PhotoImage | None = None
         self.uvc_cam: uvc.UVCCamera | None = None
@@ -351,6 +354,9 @@ class P3GUI:
         box.pack(fill="x", padx=10, pady=(12, 0))
         self.lbl_conn = ttk.Label(box, text="○ Connecting...", style="Dim.TLabel")
         self.lbl_conn.pack(anchor="w")
+        self.lbl_feed = ttk.Label(box, text="", style="Dim.TLabel",
+                                  wraplength=290, justify="left")
+        self.lbl_feed.pack(anchor="w", pady=(4, 0))
         self.btn_reconnect = ttk.Button(box, text="Reconnect",
                                         command=self._reconnect)
         self.btn_reconnect.pack(fill="x", pady=(8, 0))
@@ -1001,7 +1007,7 @@ class P3GUI:
         self.viewer.camera.env_params.emissivity = float(self.var_emis.get())
 
     def _shutter(self) -> None:
-        self.capture.post(self.viewer.camera.trigger_shutter)
+        self.capture.post(self.viewer.trigger_shutter)
 
     def _apply_cmap(self) -> None:
         self.viewer.colormap_idx = int(ColormapID[self.var_cmap.get()])
@@ -1030,8 +1036,21 @@ class P3GUI:
         if frame is not None:
             self._show(frame)
         self._update_connection()
+        self._update_feed()
         self._update_status()
         self.root.after(33, self._tick)
+
+    def _update_feed(self) -> None:
+        if self.feed is None:
+            return
+        text = self.feed.status()
+        if self.feed.error:
+            colour = REC_RED
+        elif self.feed.clients and self.feed.last_sent is not None                 and time.time() - self.feed.last_sent_at < 1.0:
+            colour = OK_GREEN
+        else:
+            colour = FG_DIM
+        self.lbl_feed.config(text=text, foreground=colour)
 
     def _update_connection(self) -> None:
         state = self.capture.state
@@ -1213,6 +1232,19 @@ def main() -> None:
     parser.add_argument("--log-strength", type=float, default=50.0,
                         help="Log curve strength; higher lifts the cool end "
                              "more (default: 50)")
+    parser.add_argument("--temp-feed", action="store_true",
+                        help="Serve the max temperature to the Sonia press over "
+                             "TCP as newline-delimited JSON")
+    parser.add_argument("--temp-host", default=temp_feed.DEFAULT_HOST,
+                        help=f"Feed bind address (default: {temp_feed.DEFAULT_HOST})")
+    parser.add_argument("--temp-port", type=int, default=temp_feed.DEFAULT_PORT,
+                        help=f"Feed port (default: {temp_feed.DEFAULT_PORT})")
+    parser.add_argument("--temp-hz", type=float, default=temp_feed.DEFAULT_HZ,
+                        help=f"Feed rate (default: {temp_feed.DEFAULT_HZ:g})")
+    parser.add_argument("--temp-roi", nargs=4, type=int, default=None,
+                        metavar=("X", "Y", "W", "H"),
+                        help="Region of interest in sensor pixels for the fed "
+                             "maximum; the default is the whole frame")
     parser.add_argument("--no-compress", action="store_true",
                         help="Store the thermal stream as a plain .raw file "
                              "instead of the block-compressed .tz")
@@ -1247,8 +1279,19 @@ def main() -> None:
     # GUI previews at native scale and fits to the window instead.
     viewer.zoom = 2
 
+    if args.temp_roi:
+        viewer.temp_roi = tuple(args.temp_roi)
+
+    feed = None
+    if args.temp_feed:
+        feed = temp_feed.TempFeedServer(
+            viewer.latest_max_temp_c, host=args.temp_host,
+            port=args.temp_port, hz=args.temp_hz,
+        )
+        feed.start()
+
     root = tk.Tk()
-    P3GUI(root, viewer, uvc_index=args.uvc)
+    P3GUI(root, viewer, uvc_index=args.uvc, feed=feed)
     root.mainloop()
 
 

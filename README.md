@@ -175,6 +175,40 @@ if present. If either is missing the capture still runs -- the sound is simply l
 `audio.wav` beside the video, and the sidecar says so. Muxing uses `-shortest`, so the
 combined file is as long as the shorter of the two streams.
 
+### Sonia temperature feed
+
+Sonia is an ultrasonic wood press that regulates power against the sample's maximum
+temperature and cannot measure that itself. `--temp-feed` serves the measurement to
+it over TCP as newline-delimited JSON:
+
+```bash
+p3-gui --range 20 350 --gain low --temp-feed
+p3-viewer --temp-feed --temp-port 9999 --temp-roi 96 64 64 64
+```
+
+One object per line, at 10 Hz by default:
+
+```json
+{"max_temp_c": 97.5}
+```
+
+`--temp-roi X Y W H` restricts the maximum to a region of the sensor, in pixels; the
+default is the whole frame. Emissivity and the environmental correction are applied
+before sending, so the number is used exactly as received.
+
+**Silence is the fault signal.** When there is no fresh reading the server sends
+nothing -- it never repeats the last value, interpolates, or emits a placeholder.
+Sonia treats a gap beyond its staleness timeout as a sensor fault and cuts the
+ultrasound, and that timeout is the only thing protecting the sample. A repeated
+value would look like a healthy feed and defeat it. The stream therefore stops
+whenever the camera disconnects or stalls, a frame fails, the shutter/NUC runs, the
+region of interest falls outside the frame, or a reading lands outside -50..1000 C.
+It resumes on its own when a real reading returns; nothing has to be signalled.
+
+The **Camera link** panel shows the feed's address, client count and the last value
+sent, or that it has stopped. The full specification is `TEMP_FEED_PROTOCOL.md` in
+the Sonia repository.
+
 ### Replay
 
 ```bash
