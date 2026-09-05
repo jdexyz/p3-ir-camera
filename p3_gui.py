@@ -215,6 +215,10 @@ class P3GUI:
         self._mux_thread: threading.Thread | None = None
         self._closing = False
         self._combined: cv2.VideoWriter | None = None
+        # The capture thread writes to the combined writer while the Tk thread
+        # can close it. Releasing a VideoWriter under a concurrent write is a
+        # use-after-free inside OpenCV, so every access is serialised.
+        self._combined_lock = threading.Lock()
         self._combined_size: tuple[int, int] | None = None
         self._combined_frames = 0
         self._combined_split = 0
@@ -755,17 +759,20 @@ class P3GUI:
         align the sound against.
         """
         visible = self.uvc_cam.latest() if self.uvc_cam is not None else None
-        if self._combined is None:
-            self._open_combined_now(thermal, visible)
+        # The lock is held across the write: closing the writer from the Tk
+        # thread while this write is in flight is a use-after-free in OpenCV.
+        with self._combined_lock:
             if self._combined is None:
-                return
-        frame = self._stacked(thermal, visible) if visible is not None else thermal
-        w, h = self._combined_size or (0, 0)
-        if (frame.shape[1], frame.shape[0]) != (w, h):
-            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        self._combined.write(frame)
-        self._combined_frames += 1
-        self._combined_end = when or time.time()
+                self._open_combined_now(thermal, visible)
+                if self._combined is None:
+                    return
+            frame = self._stacked(thermal, visible) if visible is not None else thermal
+            w, h = self._combined_size or (0, 0)
+            if (frame.shape[1], frame.shape[0]) != (w, h):
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            self._combined.write(frame)
+            self._combined_frames += 1
+            self._combined_end = when or time.time()
 
     def _open_combined(self, session: str) -> None:
         """Arm the combined writer; it opens on the first frame that arrives.
@@ -799,12 +806,15 @@ class P3GUI:
         self._combined_end = self._combined_start
 
     def _close_combined(self) -> dict[str, object]:
+        # Drop the hook first so no new frame enters, then take the lock to
+        # wait out any write already in flight before releasing.
         self.viewer.frame_hook = None
-        self._combined_pending = None
-        writer, self._combined = self._combined, None
-        if writer is None:
-            return {}
-        writer.release()
+        with self._combined_lock:
+            self._combined_pending = None
+            writer, self._combined = self._combined, None
+            if writer is None:
+                return {}
+            writer.release()
         span = max(self._combined_end - self._combined_start, 1e-6)
         return {
             "file": "combined.mp4",

@@ -1239,7 +1239,8 @@ class P3Viewer:
 
         print(
             f"Stopped: {self._rec_count} frames, {elapsed:.1f}s "
-            f"({meta['measured_fps']:g} fps) -> {base}.mp4 / {base}.raw / {base}.json"
+            f"({meta['measured_fps']:g} fps) -> {os.path.basename(base)}.mp4 / "
+            f"{thermal_file} / {os.path.basename(base)}.json"
         )
         self._rec_count = 0
         self._rec_size = None
