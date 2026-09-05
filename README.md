@@ -181,10 +181,17 @@ Sonia is an ultrasonic wood press that regulates power against the sample's maxi
 temperature and cannot measure that itself. `--temp-feed` serves the measurement to
 it over TCP as newline-delimited JSON:
 
+The feed is **on by default**, so a plain launch -- including from the desktop
+shortcut -- already serves it. `--no-temp-feed` turns it off.
+
 ```bash
-p3-gui --range 20 350 --gain low --temp-feed
-p3-viewer --temp-feed --temp-port 9999 --temp-roi 96 64 64 64
+p3-gui                                          # feed already running
+p3-viewer --temp-port 9999 --temp-roi 96 64 64 64
+p3-gui --no-temp-feed                           # opt out
 ```
+
+If the port is already taken, usually by a second copy of the program, the failure
+is reported in the **Camera link** panel and everything else carries on.
 
 One object per line, at 10 Hz by default:
 

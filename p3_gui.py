@@ -1202,6 +1202,8 @@ class P3GUI:
         ):
             return
         self._closing = True
+        if self.feed is not None:
+            self.feed.stop()
         self._close_combined()
         self._stop_uvc_recording()
         self._stop_audio()
@@ -1233,8 +1235,10 @@ def main() -> None:
                         help="Log curve strength; higher lifts the cool end "
                              "more (default: 50)")
     parser.add_argument("--temp-feed", action="store_true",
-                        help="Serve the max temperature to the Sonia press over "
-                             "TCP as newline-delimited JSON")
+                        help="Serve the max temperature to the Sonia press "
+                             "(this is the default; kept for explicitness)")
+    parser.add_argument("--no-temp-feed", action="store_true",
+                        help="Do not serve the temperature feed")
     parser.add_argument("--temp-host", default=temp_feed.DEFAULT_HOST,
                         help=f"Feed bind address (default: {temp_feed.DEFAULT_HOST})")
     parser.add_argument("--temp-port", type=int, default=temp_feed.DEFAULT_PORT,
@@ -1283,7 +1287,7 @@ def main() -> None:
         viewer.temp_roi = tuple(args.temp_roi)
 
     feed = None
-    if args.temp_feed:
+    if not args.no_temp_feed:
         feed = temp_feed.TempFeedServer(
             viewer.latest_max_temp_c, host=args.temp_host,
             port=args.temp_port, hz=args.temp_hz,
