@@ -427,7 +427,9 @@ class P3Viewer:
         self.show_reticule: bool = True
         self.show_timestamp: bool = show_timestamp
         self.show_colorbar: bool = True
-        self.hotspot_mode: int = HotspotMode.OFF
+        # The hottest point is the reading people look for; the coldest is
+        # rarely the subject, so it is off unless asked for.
+        self.hotspot_mode: int = HotspotMode.MAX
         self.zoom: int = 3
         self.fps: float = 0.0
         self.enhanced: bool = True

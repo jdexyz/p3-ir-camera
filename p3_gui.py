@@ -333,13 +333,16 @@ class P3GUI:
                                 fg=FG_DIM, font=("Segoe UI", 11))
         self.preview.place(relx=0.5, rely=0.5, anchor="center")
 
-        self._build_connection(side)
-        self._build_view(side)
-        self._build_record(side)
-        self._build_visible(side)
+        # Record first and alone: it is the control that has to be found
+        # instantly mid-experiment, so nothing shares the top of the panel.
+        self._build_record_button(side)
         self._build_scale(side)
         self._build_camera(side)
+        self._build_view(side)
+        self._build_visible(side)
         self._build_display(side)
+        self._build_connection(side)
+        self._build_record_settings(side)
         self._sync_strength_enabled()
         self._sync_focus_enabled()
 
@@ -377,9 +380,26 @@ class P3GUI:
         """The webcam is needed to show it, or to record it."""
         return self.var_view.get() in ("both", "visible") or self.var_uvc_on.get()
 
-    def _build_record(self, parent: tk.Widget) -> None:
-        box = ttk.Labelframe(parent, text=" Recording ", padding=10)
-        box.pack(fill="x", padx=10, pady=(12, 6))
+    def _build_record_button(self, parent: tk.Widget) -> None:
+        """The record control alone, with only its own live status beside it."""
+        box = ttk.Frame(parent, style="Panel.TFrame")
+        box.pack(fill="x", padx=10, pady=(12, 4))
+
+        self.btn_record = tk.Button(
+            box, text="●  Start Recording", command=self._toggle_record,
+            bg=REC_RED, fg="white", activebackground="#d63c3c",
+            activeforeground="white", relief="flat", bd=0,
+            font=("Segoe UI", 12, "bold"), pady=14, cursor="hand2",
+        )
+        self.btn_record.pack(fill="x")
+
+        self.lbl_rec = ttk.Label(box, text="Not recording", style="Dim.TLabel")
+        self.lbl_rec.pack(anchor="w", pady=(6, 0))
+
+    def _build_record_settings(self, parent: tk.Widget) -> None:
+        """Where a recording goes, and what to do with earlier ones."""
+        box = ttk.Labelframe(parent, text=" Recording files ", padding=10)
+        box.pack(fill="x", padx=10, pady=6)
 
         row = ttk.Frame(box, style="Panel.TFrame")
         row.pack(fill="x")
@@ -392,19 +412,8 @@ class P3GUI:
         self.var_name = tk.StringVar(value=self._default_name())
         ttk.Entry(box, textvariable=self.var_name).pack(fill="x", pady=(2, 10))
 
-        self.btn_record = tk.Button(
-            box, text="●  Start Recording", command=self._toggle_record,
-            bg=REC_RED, fg="white", activebackground="#d63c3c",
-            activeforeground="white", relief="flat", bd=0,
-            font=("Segoe UI", 11, "bold"), pady=10, cursor="hand2",
-        )
-        self.btn_record.pack(fill="x")
-
-        self.lbl_rec = ttk.Label(box, text="Not recording", style="Dim.TLabel")
-        self.lbl_rec.pack(anchor="w", pady=(8, 0))
-
         ttk.Button(box, text="Snapshot (PNG + raw)",
-                   command=self._snapshot).pack(fill="x", pady=(8, 0))
+                   command=self._snapshot).pack(fill="x")
         ttk.Button(box, text="Replay a recording...",
                    command=self._open_replay).pack(fill="x", pady=(6, 0))
 
@@ -665,7 +674,7 @@ class P3GUI:
             ("Enhanced (CLAHE + DDE)", self.var_enh),
             ("Reticule", self.var_ret),
             ("Colorbar", self.var_cbar),
-            ("Min/max markers", self.var_hot),
+            ("Hottest point marker", self.var_hot),
             ("Date/time stamp", self.var_stamp),
             ("Mirror", self.var_mirror),
         ):
@@ -1004,7 +1013,7 @@ class P3GUI:
         v.show_reticule = self.var_ret.get()
         v.show_colorbar = self.var_cbar.get()
         v.mirror = self.var_mirror.get()
-        v.hotspot_mode = HotspotMode.MINMAX if self.var_hot.get() else HotspotMode.OFF
+        v.hotspot_mode = HotspotMode.MAX if self.var_hot.get() else HotspotMode.OFF
         v.show_timestamp = self.var_stamp.get()
         if self.uvc_cam is not None:
             self.uvc_cam.show_timestamp = self.var_stamp.get()
@@ -1197,7 +1206,10 @@ def main() -> None:
     parser.add_argument("--range", nargs=2, type=float, metavar=("MIN_C", "MAX_C"),
                         default=None, help="Start with this fixed absolute scale")
     parser.add_argument("--log", action="store_true",
-                        help="Start with the logarithmic mapping of --range")
+                        help="Start with the logarithmic mapping of --range "
+                             "(this is the default; kept for explicitness)")
+    parser.add_argument("--linear", action="store_true",
+                        help="Map --range linearly instead of logarithmically")
     parser.add_argument("--log-strength", type=float, default=50.0,
                         help="Log curve strength; higher lifts the cool end "
                              "more (default: 50)")
@@ -1217,15 +1229,15 @@ def main() -> None:
 
     if args.range is not None and args.range[0] >= args.range[1]:
         parser.error("--range MIN_C must be less than MAX_C")
-    if args.log and args.range is None:
-        parser.error("--log requires --range")
+    if args.log and args.linear:
+        parser.error("--log and --linear are mutually exclusive")
     if args.log_strength <= 0:
         parser.error("--log-strength must be positive")
 
     viewer = P3Viewer(
         model=args.model,
         fixed_range=tuple(args.range) if args.range else None,
-        log_scale=args.log,
+        log_scale=not args.linear,
         log_strength=args.log_strength,
         show_timestamp=not args.no_timestamp,
         compress_raw=not args.no_compress,
