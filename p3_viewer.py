@@ -120,8 +120,11 @@ class HotspotMode(IntEnum):
 COLORMAPS: dict[ColormapID, NDArray[np.uint8]] = {}
 
 # Color constants
-COLOR_SPOT_MAX =    (0,0,255)
-COLOR_SPOT_MIN =    (255,0,0)
+# BGR. The hottest point sits on the bright end of the colormap -- yellow and
+# white in ironbow -- where red text disappears. A vivid azure reads against
+# that and still stands out on the dark cold end, unlike a pure blue.
+COLOR_SPOT_MAX =    (255,170,0)
+COLOR_SPOT_MIN =    (0,0,255)
 COLOR_RETICULE =    (0,255,0)
 COLOR_TEXT =        (255,255,255)
 
